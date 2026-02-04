@@ -15,6 +15,7 @@ from io import BytesIO
 from typing import Any, List, Optional
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 import httpx
 import numpy as np
 import requests
@@ -38,6 +39,13 @@ import logging
 
 parser = argparse.ArgumentParser(description="Run the server with specified host and port.")
 parser.add_argument("--port", type=str, default=8188, help="Server address to connect to.")
+parser.add_argument("--public-base-url", type=str, default=None, help="Public base URL for image links.")
+parser.add_argument("--object-storage-enabled", type=str, default=None, help="Enable object storage: true/false.")
+parser.add_argument("--object-storage-base-url", type=str, default=None, help="Object storage API base URL.")
+parser.add_argument("--object-storage-public-base-url", type=str, default=None, help="Public object storage URL.")
+parser.add_argument("--object-storage-api-key", type=str, default=None, help="Object storage API key.")
+parser.add_argument("--object-storage-channel", type=str, default=None, help="Object storage channel.")
+parser.add_argument("--object-storage-custom-filename", type=str, default=None, help="Object storage custom filename.")
 args = parser.parse_args()
 server_address = f"127.0.0.1:{args.port}"
 # 默认的端口是server_address的端口+10000
@@ -48,6 +56,108 @@ main_path = os.path.join(current_dir_path, "..", "..", "main.py")
 
 # 全局变量来存储ComfyUI进程
 comfyui_process = None
+
+def parse_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+def resolve_public_base_url(request: Optional[Request] = None):
+    cli_public_base_url = (args.public_base_url or "").strip()
+    env_public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
+    conf_public_base_url = config.get("API_KEYS", "public_base_url", fallback="").strip()
+    public_base_url = cli_public_base_url or env_public_base_url or conf_public_base_url
+    if public_base_url:
+        return public_base_url.rstrip("/")
+
+    if request is not None:
+        proto = request.headers.get("x-forwarded-proto")
+        host = request.headers.get("x-forwarded-host")
+        if host:
+            return f"{(proto or request.url.scheme)}://{host}".rstrip("/")
+        return str(request.base_url).rstrip("/")
+
+    return f"http://127.0.0.1:{fastapi_port}"
+
+def load_object_storage_config():
+    cli_enabled = args.object_storage_enabled
+    cli_base_url = (args.object_storage_base_url or "").strip()
+    cli_api_key = (args.object_storage_api_key or "").strip()
+    cli_channel = (args.object_storage_channel or "").strip()
+    cli_custom_filename = (args.object_storage_custom_filename or "").strip()
+    cli_public_base_url = (args.object_storage_public_base_url or "").strip()
+
+    enabled = parse_bool(
+        cli_enabled
+        or os.getenv("OBJECT_STORAGE_ENABLED")
+        or config.get("API_KEYS", "object_storage_enabled", fallback=""),
+        default=False,
+    )
+    base_url = (
+        cli_base_url
+        or os.getenv("OBJECT_STORAGE_BASE_URL", "").strip()
+        or config.get("API_KEYS", "object_storage_base_url", fallback="").strip()
+    )
+    api_key = (
+        cli_api_key
+        or os.getenv("OBJECT_STORAGE_API_KEY", "").strip()
+        or config.get("API_KEYS", "object_storage_api_key", fallback="").strip()
+    )
+    channel = (
+        cli_channel
+        or os.getenv("OBJECT_STORAGE_CHANNEL", "").strip()
+        or config.get("API_KEYS", "object_storage_channel", fallback="default").strip()
+        or "default"
+    )
+    custom_filename = (
+        cli_custom_filename
+        or os.getenv("OBJECT_STORAGE_CUSTOM_FILENAME", "").strip()
+        or config.get("API_KEYS", "object_storage_custom_filename", fallback="").strip()
+    )
+    public_base_url = (
+        cli_public_base_url
+        or os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL", "").strip()
+        or config.get("API_KEYS", "object_storage_public_base_url", fallback="").strip()
+        or base_url
+    )
+    return {
+        "enabled": enabled and bool(base_url) and bool(api_key),
+        "base_url": base_url.rstrip("/"),
+        "api_key": api_key,
+        "channel": channel,
+        "custom_filename": custom_filename,
+        "public_base_url": public_base_url.rstrip("/"),
+    }
+
+def upload_to_object_storage(image_bytes, counter, storage_config, model_name):
+    upload_url = f"{storage_config['base_url']}/api/files/upload"
+    headers = {
+        "X-API-Key": storage_config["api_key"],
+        "X-Channel": storage_config["channel"],
+    }
+    custom_filename = storage_config["custom_filename"]
+    if custom_filename:
+        base, ext = os.path.splitext(custom_filename)
+        filename = f"{base}_{counter}{ext or '.png'}"
+    else:
+        safe_model_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name) or "workflow"
+        filename = f"{safe_model_name}_{int(time.time())}_{counter}.png"
+
+    files = {"file": (filename, image_bytes, "image/png")}
+    params = {"custom_filename": filename}
+    response = requests.post(upload_url, headers=headers, files=files, params=params, timeout=120)
+    if response.status_code != 200:
+        raise RuntimeError(f"Object storage upload failed: {response.status_code} {response.text}")
+
+    data = response.json()
+    stored_filename = data.get("stored_filename") or data.get("filename")
+    if not stored_filename:
+        raise RuntimeError("Object storage response missing stored filename")
+
+    quoted_name = urllib.parse.quote(stored_filename)
+    return f"{storage_config['public_base_url']}/api/files/{quoted_name}"
 
 def cleanup():
     global comfyui_process
@@ -149,6 +259,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+output_dir = os.path.join(current_dir_path, "output")
+os.makedirs(output_dir, exist_ok=True)
+app.mount("/images", StaticFiles(directory=output_dir), name="images")
 
 class Message(BaseModel):
     role: str
@@ -250,10 +363,10 @@ async def stream_response(response_text: str, model_name: str):
     yield "data: [DONE]\n\n"
 
 @app.post("/v1/chat/completions")
-async def create_completion(request_data: CompletionRequest, dependency=Depends(verify_api_key)):
+async def create_completion(request_data: CompletionRequest, request: Request, dependency=Depends(verify_api_key)):
     try:
         if request_data.stream:
-            response = await process_request(request_data)
+            response = await process_request(request_data, request)
             if isinstance(response, dict) and "choices" in response:
                 content = response["choices"][0]["message"]["content"]
                 return StreamingResponse(
@@ -261,13 +374,13 @@ async def create_completion(request_data: CompletionRequest, dependency=Depends(
                     media_type="text/event-stream"
                 )
         else:
-            response = await process_request(request_data)
+            response = await process_request(request_data, request)
 
         return response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_request(request_data: CompletionRequest):
+async def process_request(request_data: CompletionRequest, request: Optional[Request] = None):
     model_name = request_data.model
     print(model_name)
     base64_encoded_list = []
@@ -340,44 +453,51 @@ async def process_request(request_data: CompletionRequest):
         user_histories,
     )
     all_response = {"text":"", "image_urls":[],"audio_url":"","vedio_url":""}
-    if images is not None or images != []:
+    if images is not None and images != []:
         base64_images = []
+        object_storage_config = load_object_storage_config()
+        public_base_url = resolve_public_base_url(request)
+        config_path = os.path.join(current_dir_path, "config.ini")
+        config = configparser.ConfigParser()
+        config.read(config_path, encoding="utf-8")
+        api_keys = {}
+        if "API_KEYS" in config:
+            api_keys = config["API_KEYS"]
 
+        imgbb_key = api_keys.get("imgbb_api")
+
+        counter = 0
         for node_id in images:
             for image_data in images[node_id]:
+                counter += 1
                 img_base64 = base64.b64encode(image_data).decode("utf-8")
+                if object_storage_config["enabled"]:
+                    try:
+                        image_url = upload_to_object_storage(image_data, counter, object_storage_config, model_name)
+                        base64_images.append(image_url)
+                        continue
+                    except Exception as upload_err:
+                        print(f"Object storage upload failed, fallback to local output: {upload_err}")
 
-            config_path = os.path.join(current_dir_path, "config.ini")
-            config = configparser.ConfigParser()
-            config.read(config_path, encoding="utf-8")
-            api_keys = {}
-            if "API_KEYS" in config:
-                api_keys = config["API_KEYS"]
-
-            imgbb_key = api_keys.get("imgbb_api")
-            print(imgbb_key)
-
-            if imgbb_key is None or imgbb_key == "":
-                # 把img_base64保存到当前目录下的output文件夹
-                output_dir = os.path.join(current_dir_path, "output")
-                os.makedirs(output_dir, exist_ok=True)
-                # 时间戳
-                timestamp = int(time.time())
-                filename = os.path.join(output_dir, f"{timestamp}.png")
-                with open(filename, "wb") as f:
-                    f.write(base64.b64decode(img_base64))
-                base64_images.append(filename)
-            else:
-                url = "https://api.imgbb.com/1/upload"
-                payload = {"key": imgbb_key, "image": img_base64}
-                response0 = requests.post(url, data=payload)
-                if response0.status_code == 200:
-                    result = response0.json()
-                    img_url = result["data"]["url"]
+                if imgbb_key is None or imgbb_key == "":
+                    # 把img_base64保存到当前目录下的output文件夹
+                    timestamp = int(time.time())
+                    filename = f"{timestamp}_{counter}.png"
+                    local_file_path = os.path.join(output_dir, filename)
+                    with open(local_file_path, "wb") as f:
+                        f.write(base64.b64decode(img_base64))
+                    base64_images.append(f"{public_base_url}/images/{filename}")
                 else:
-                    return "Error: " + response0.text
-                print(img_url)
-                base64_images.append(img_url)
+                    url = "https://api.imgbb.com/1/upload"
+                    payload = {"key": imgbb_key, "image": img_base64}
+                    response0 = requests.post(url, data=payload)
+                    if response0.status_code == 200:
+                        result = response0.json()
+                        img_url = result["data"]["url"]
+                    else:
+                        return "Error: " + response0.text
+                    print(img_url)
+                    base64_images.append(img_url)
 
         all_response["image_urls"]= base64_images
     elif response is not None:
