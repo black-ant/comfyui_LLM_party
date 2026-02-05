@@ -95,18 +95,6 @@ python fast_api.py \
   --object-storage-channel users
 ```
 
-或 `fast_api_v2.py`：
-
-```bash
-python fast_api_v2.py \
-  --port 8188 \
-  --public-base-url "https://your-fastapi.modal.run" \
-  --object-storage-enabled true \
-  --object-storage-base-url "https://your-storage.modal.run" \
-  --object-storage-api-key "$OBJECT_STORAGE_API_KEY" \
-  --object-storage-channel users
-```
-
 ---
 
 ## 6. 与现有代码的集成点
@@ -114,7 +102,6 @@ python fast_api_v2.py \
 主要改动点：
 
 1. `fast_api.py` 的图片返回分支（现在是写本地文件并拼 `/images/...`）
-2. `fast_api_v2.py` 的图片分支（同理）
 
 新增一个上传函数（建议复用 `requests`）：
 
@@ -175,5 +162,4 @@ def upload_to_object_storage(image_bytes: bytes, filename: str | None = None) ->
 
 1. 先确认“下载鉴权策略”（公开读 / 签名 URL / 代理下载）；
 2. 在 `fast_api.py` 完成接入并验证；
-3. 同步到 `fast_api_v2.py`；
-4. 再做配置文档与部署模板（Modal secrets / env）。
+3. 再做配置文档与部署模板（Modal secrets / env）。
