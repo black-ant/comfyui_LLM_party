@@ -66,3 +66,4 @@ attrdict
 docstring_parser
 langchain_ollama
 timm
+minio

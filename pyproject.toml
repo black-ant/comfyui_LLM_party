@@ -73,6 +73,7 @@ dependencies = [
     "docstring-parser>=0.16",
     "langchain-ollama>=0.3.2",
     "timm>=1.0.15",
+    "minio>=7.2.18",
 ]
 
 [project.urls]
