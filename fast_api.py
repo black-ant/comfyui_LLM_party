@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
-from storage_backends import create_storage_backend, load_storage_settings
+from storage_backends import create_storage_backend, load_storage_settings, parse_bool
 import asyncio
 parser = argparse.ArgumentParser(description="Run the server with specified host and port.")
 parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address to bind the server.")
@@ -38,6 +38,9 @@ parser.add_argument("--object-storage-channel", type=str, default=None, help="St
 parser.add_argument("--object-storage-custom-filename", type=str, default=None, help="Object storage custom filename.")
 
 args = parser.parse_args()
+if parse_bool(args.object_storage_enabled, default=False) and not (args.object_storage_type or "").strip():
+    parser.error("--object-storage-type is required when --object-storage-enabled=true")
+
 current_dir_path = os.path.dirname(os.path.realpath(__file__))
 config = configparser.ConfigParser()
 config.read(os.path.join(current_dir_path, "config.ini"))
