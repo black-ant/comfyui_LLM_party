@@ -25,6 +25,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
+from storage_backends import create_storage_backend, load_storage_settings
 
 current_dir_path = os.path.dirname(os.path.realpath(__file__))
 config = configparser.ConfigParser()
@@ -40,12 +41,13 @@ import logging
 parser = argparse.ArgumentParser(description="Run the server with specified host and port.")
 parser.add_argument("--port", type=str, default=8188, help="Server address to connect to.")
 parser.add_argument("--public-base-url", type=str, default=None, help="Public base URL for image links.")
-parser.add_argument("--object-storage-enabled", type=str, default=None, help="Enable MinIO object storage: true/false.")
-parser.add_argument("--object-storage-base-url", type=str, default=None, help="MinIO endpoint URL (kept for compatibility).")
-parser.add_argument("--object-storage-public-base-url", type=str, default=None, help="Public MinIO base URL.")
-parser.add_argument("--object-storage-api-key", type=str, default=None, help="MinIO access key (or access_key:secret_key).")
-parser.add_argument("--object-storage-secret-key", type=str, default=None, help="MinIO secret key.")
-parser.add_argument("--object-storage-channel", type=str, default=None, help="MinIO bucket name (kept for compatibility).")
+parser.add_argument("--object-storage-enabled", type=str, default=None, help="Enable external storage: true/false.")
+parser.add_argument("--object-storage-type", type=str, default=None, help="Storage backend type: modal|minio|local.")
+parser.add_argument("--object-storage-base-url", type=str, default=None, help="Storage base URL / endpoint.")
+parser.add_argument("--object-storage-public-base-url", type=str, default=None, help="Public storage URL.")
+parser.add_argument("--object-storage-api-key", type=str, default=None, help="Storage API key / access key.")
+parser.add_argument("--object-storage-secret-key", type=str, default=None, help="Storage secret key for MinIO.")
+parser.add_argument("--object-storage-channel", type=str, default=None, help="Storage channel (Modal) / bucket (MinIO).")
 parser.add_argument("--object-storage-custom-filename", type=str, default=None, help="Object storage custom filename.")
 args = parser.parse_args()
 server_address = f"127.0.0.1:{args.port}"
@@ -57,48 +59,6 @@ main_path = os.path.join(current_dir_path, "..", "..", "main.py")
 
 # 全局变量来存储ComfyUI进程
 comfyui_process = None
-
-def parse_bool(value, default=False):
-    if value is None:
-        return default
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
-def split_access_and_secret(value: str):
-    raw = (value or "").strip()
-    if not raw:
-        return "", ""
-    for sep in (":", "|", ","):
-        if sep in raw:
-            access_key, secret_key = raw.split(sep, 1)
-            return access_key.strip(), secret_key.strip()
-    return raw, ""
-
-
-def parse_minio_endpoint(endpoint_url: str):
-    raw = (endpoint_url or "").strip()
-    if not raw:
-        return "", False
-    normalized = raw if "://" in raw else f"http://{raw}"
-    parsed = urllib.parse.urlparse(normalized)
-    endpoint = (parsed.netloc or parsed.path).strip().strip("/")
-    if "/" in endpoint:
-        endpoint = endpoint.split("/", 1)[0]
-    return endpoint, parsed.scheme == "https"
-
-
-def build_minio_public_base_url(public_base_url: str, endpoint: str, secure: bool, bucket: str):
-    base_url = (public_base_url or "").strip().rstrip("/")
-    if not base_url and not endpoint:
-        return ""
-    if not base_url:
-        scheme = "https" if secure else "http"
-        base_url = f"{scheme}://{endpoint}".rstrip("/")
-    if bucket and not base_url.endswith(f"/{bucket}"):
-        base_url = f"{base_url}/{bucket}"
-    return base_url.rstrip("/")
 
 def resolve_public_base_url(request: Optional[Request] = None):
     cli_public_base_url = (args.public_base_url or "").strip()
@@ -116,118 +76,6 @@ def resolve_public_base_url(request: Optional[Request] = None):
         return str(request.base_url).rstrip("/")
 
     return f"http://127.0.0.1:{fastapi_port}"
-
-def load_object_storage_config():
-    cli_enabled = args.object_storage_enabled
-    cli_endpoint_url = (args.object_storage_base_url or "").strip()
-    cli_api_key = (args.object_storage_api_key or "").strip()
-    cli_secret_key = (args.object_storage_secret_key or "").strip()
-    cli_bucket = (args.object_storage_channel or "").strip()
-    cli_custom_filename = (args.object_storage_custom_filename or "").strip()
-    cli_public_base_url = (args.object_storage_public_base_url or "").strip()
-
-    enabled = parse_bool(
-        cli_enabled
-        or os.getenv("OBJECT_STORAGE_ENABLED")
-        or config.get("API_KEYS", "object_storage_enabled", fallback=""),
-        default=False,
-    )
-    endpoint_url = (
-        cli_endpoint_url
-        or os.getenv("MINIO_ENDPOINT", "").strip()
-        or os.getenv("OBJECT_STORAGE_BASE_URL", "").strip()
-        or config.get("API_KEYS", "object_storage_base_url", fallback="").strip()
-    )
-    api_key = (
-        cli_api_key
-        or os.getenv("MINIO_ACCESS_KEY", "").strip()
-        or os.getenv("OBJECT_STORAGE_API_KEY", "").strip()
-        or config.get("API_KEYS", "object_storage_api_key", fallback="").strip()
-    )
-    secret_key = (
-        cli_secret_key
-        or os.getenv("MINIO_SECRET_KEY", "").strip()
-        or os.getenv("OBJECT_STORAGE_SECRET_KEY", "").strip()
-        or config.get("API_KEYS", "object_storage_secret_key", fallback="").strip()
-    )
-    bucket = (
-        cli_bucket
-        or os.getenv("MINIO_BUCKET", "").strip()
-        or os.getenv("OBJECT_STORAGE_CHANNEL", "").strip()
-        or config.get("API_KEYS", "object_storage_channel", fallback="default").strip()
-        or "default"
-    )
-    custom_filename = (
-        cli_custom_filename
-        or os.getenv("OBJECT_STORAGE_CUSTOM_FILENAME", "").strip()
-        or config.get("API_KEYS", "object_storage_custom_filename", fallback="").strip()
-    )
-    public_base_url = (
-        cli_public_base_url
-        or os.getenv("MINIO_PUBLIC_BASE_URL", "").strip()
-        or os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL", "").strip()
-        or config.get("API_KEYS", "object_storage_public_base_url", fallback="").strip()
-    )
-    endpoint, endpoint_is_https = parse_minio_endpoint(endpoint_url)
-    if not secret_key:
-        api_key, parsed_secret = split_access_and_secret(api_key)
-        secret_key = parsed_secret
-    secure = parse_bool(
-        os.getenv("MINIO_SECURE", "").strip()
-        or config.get("API_KEYS", "object_storage_secure", fallback=""),
-        default=endpoint_is_https,
-    )
-    resolved_public_base_url = build_minio_public_base_url(public_base_url, endpoint, secure, bucket)
-
-    return {
-        "enabled": enabled and bool(endpoint) and bool(api_key) and bool(secret_key) and bool(bucket),
-        "endpoint": endpoint,
-        "access_key": api_key,
-        "secret_key": secret_key,
-        "bucket": bucket,
-        "secure": secure,
-        "custom_filename": custom_filename,
-        "public_base_url": resolved_public_base_url,
-    }
-
-def upload_to_object_storage(image_bytes, counter, storage_config, model_name):
-    try:
-        from minio import Minio
-    except ImportError as exc:
-        raise RuntimeError("Missing dependency: minio. Please install it first.") from exc
-
-    custom_filename = storage_config["custom_filename"]
-    if custom_filename:
-        base, ext = os.path.splitext(custom_filename)
-        object_name = f"{base}_{counter}{ext or '.png'}"
-    else:
-        safe_model_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name) or "workflow"
-        object_name = f"{safe_model_name}_{int(time.time())}_{counter}.png"
-
-    client = Minio(
-        storage_config["endpoint"],
-        access_key=storage_config["access_key"],
-        secret_key=storage_config["secret_key"],
-        secure=storage_config["secure"],
-    )
-
-    bucket = storage_config["bucket"]
-    try:
-        if not client.bucket_exists(bucket):
-            client.make_bucket(bucket)
-    except Exception:
-        pass
-
-    data_stream = BytesIO(image_bytes)
-    client.put_object(
-        bucket,
-        object_name,
-        data_stream,
-        length=len(image_bytes),
-        content_type="image/png",
-    )
-    quoted_name = urllib.parse.quote(object_name, safe="/")
-    return f"{storage_config['public_base_url']}/{quoted_name}"
 
 def cleanup():
     global comfyui_process
@@ -525,29 +373,48 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
     all_response = {"text":"", "image_urls":[],"audio_url":"","vedio_url":""}
     if images is not None and images != []:
         base64_images = []
-        object_storage_config = load_object_storage_config()
         public_base_url = resolve_public_base_url(request)
         config_path = os.path.join(current_dir_path, "config.ini")
-        config = configparser.ConfigParser()
-        config.read(config_path, encoding="utf-8")
+        runtime_config = configparser.ConfigParser()
+        runtime_config.read(config_path, encoding="utf-8")
         api_keys = {}
-        if "API_KEYS" in config:
-            api_keys = config["API_KEYS"]
+        if "API_KEYS" in runtime_config:
+            api_keys = runtime_config["API_KEYS"]
 
         imgbb_key = api_keys.get("imgbb_api")
+        storage_backend = None
+        try:
+            storage_settings = load_storage_settings(
+                runtime_config,
+                cli_type=args.object_storage_type,
+                cli_enabled=args.object_storage_enabled,
+                cli_base_url=args.object_storage_base_url,
+                cli_public_base_url=args.object_storage_public_base_url,
+                cli_api_key=args.object_storage_api_key,
+                cli_secret_key=args.object_storage_secret_key,
+                cli_channel=args.object_storage_channel,
+                cli_custom_filename=args.object_storage_custom_filename,
+            )
+            storage_backend = create_storage_backend(
+                storage_settings,
+                output_dir=output_dir,
+                public_base_url=public_base_url,
+            )
+        except Exception as backend_err:
+            print(f"Storage backend init failed, fallback to local/imgbb: {backend_err}")
 
         counter = 0
         for node_id in images:
             for image_data in images[node_id]:
                 counter += 1
                 img_base64 = base64.b64encode(image_data).decode("utf-8")
-                if object_storage_config["enabled"]:
+                if storage_backend is not None:
                     try:
-                        image_url = upload_to_object_storage(image_data, counter, object_storage_config, model_name)
+                        image_url = storage_backend.upload(image_data, counter, model_name)
                         base64_images.append(image_url)
                         continue
                     except Exception as upload_err:
-                        print(f"MinIO upload failed, fallback to local output: {upload_err}")
+                        print(f"{storage_backend.name} upload failed, fallback to local/imgbb: {upload_err}")
 
                 if imgbb_key is None or imgbb_key == "":
                     # 把img_base64保存到当前目录下的output文件夹

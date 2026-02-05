@@ -14,11 +14,13 @@ language=#zh_CN or en_US
 fastapi_api_key=
 public_base_url=
 object_storage_enabled=false
+object_storage_type=
 object_storage_base_url=
 object_storage_api_key=
 object_storage_secret_key=
 object_storage_channel=users
 object_storage_custom_filename=
+object_storage_secure=
 fish_api_key= fish_api_key_put_here
 fast_installed= True
 
