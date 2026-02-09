@@ -69,6 +69,22 @@ def _json_dumps_for_log(value):
 def _log_request(stage: str, request_id: str, payload):
     print(f"[FASTAPI][{request_id}][{stage}] {_json_dumps_for_log(payload)}")
 
+
+def _log_prompt_texts(
+    request_id: str,
+    workflow_path: str,
+    system_prompt: str,
+    user_prompt: str,
+    positive_prompt: str,
+    negative_prompt: str,
+):
+    # Keep prompt logs human-readable in terminal output.
+    print(f"[FASTAPI][{request_id}][PROMPT][workflow] {workflow_path}")
+    print(f"[FASTAPI][{request_id}][PROMPT][system] {system_prompt}")
+    print(f"[FASTAPI][{request_id}][PROMPT][user] {user_prompt}")
+    print(f"[FASTAPI][{request_id}][PROMPT][positive] {positive_prompt}")
+    print(f"[FASTAPI][{request_id}][PROMPT][negative] {negative_prompt}")
+
 def resolve_public_base_url(request: Optional[Request] = None):
     cli_public_base_url = (args.public_base_url or "").strip()
     env_public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
@@ -211,6 +227,14 @@ def api(
             "user_history": user_history,
             "image_input_count": len(image_input) if isinstance(image_input, list) else 0,
         },
+    )
+    _log_prompt_texts(
+        request_id=request_id,
+        workflow_path=workflow_path,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        positive_prompt=positive_prompt,
+        negative_prompt=negative_prompt,
     )
     # 判断 WF_path 是否存在
     if not os.path.exists(WF_path):
@@ -502,6 +526,14 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             "image_tensor_count": len(img_out),
         },
     )
+    _log_prompt_texts(
+        request_id=request_id,
+        workflow_path=workflow_path,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        positive_prompt="",
+        negative_prompt="",
+    )
     images, response = api(
         "",
         img_out,
@@ -535,7 +567,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 10},
         }
     else:
-        base64_images = []
+        image_entries = []
         config_path = os.path.join(current_dir_path, "config.ini")
         print(config_path)
         runtime_config = configparser.ConfigParser()
@@ -579,19 +611,21 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                 if storage_backend is not None:
                     try:
                         image_url = storage_backend.upload(image_data, counter, model_name)
-                        base64_images.append(image_url)
+                        parsed_name = os.path.basename(urllib.parse.urlparse(image_url).path)
+                        image_filename = urllib.parse.unquote(parsed_name) or f"{int(time.time() * 1000)}_{counter}.png"
+                        image_entries.append({"url": image_url, "filename": image_filename})
                         continue
                     except Exception as upload_err:
                         print(f"{storage_backend.name} upload failed, fallback to local/imgbb: {upload_err}")
 
                 if imgbb_key is None or imgbb_key == "":
-                    timestamp = int(time.time())
+                    timestamp = int(time.time() * 1000)
                     filename = f"{timestamp}_{counter}.png"
                     file_path = os.path.join(output_dir, filename)
                     with open(file_path, "wb") as f:
                         f.write(base64.b64decode(img_base64))
                     image_url = f"{public_base_url}/images/{filename}"
-                    base64_images.append(image_url)
+                    image_entries.append({"url": image_url, "filename": filename})
                 else:
                     url = "https://api.imgbb.com/1/upload"
                     payload = {"key": imgbb_key, "image": img_base64}
@@ -602,13 +636,17 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                     else:
                         return "Error: " + response0.text
                     print(img_url)
-                    base64_images.append(img_url)
+                    parsed_name = os.path.basename(urllib.parse.urlparse(img_url).path)
+                    image_filename = urllib.parse.unquote(parsed_name) or f"{int(time.time() * 1000)}_{counter}.png"
+                    image_entries.append({"url": img_url, "filename": image_filename})
             
         if response is None:
             response = ""
             
-        for img in base64_images:
-            response_url = f"![image]({img})"
+        for image_entry in image_entries:
+            image_url = image_entry["url"]
+            image_filename = image_entry["filename"]
+            response_url = f"![{image_filename}]({image_url})"
             response += "\n" + response_url + "\n"
             
         print(response)

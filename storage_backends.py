@@ -76,14 +76,15 @@ def _build_minio_public_base_url(public_base_url: str, endpoint: str, secure: bo
 
 
 def _build_object_name(custom_filename: str, counter: int, model_name: str):
+    timestamp_ms = int(time.time() * 1000)
     custom_name = _clean(custom_filename)
     if custom_name:
         custom_name = os.path.basename(custom_name)
         base, ext = os.path.splitext(custom_name)
         safe_base = re.sub(r"[^a-zA-Z0-9_.-]", "_", base) or "image"
-        return f"{safe_base}_{counter}{ext or '.png'}"
+        return f"{safe_base}_{timestamp_ms}_{counter}{ext or '.png'}"
     safe_model_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name) or "workflow"
-    return f"{safe_model_name}_{int(time.time())}_{counter}.png"
+    return f"{safe_model_name}_{timestamp_ms}_{counter}.png"
 
 
 @dataclass
