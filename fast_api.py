@@ -49,6 +49,26 @@ fastapi_api_key = config.get("API_KEYS", "fastapi_api_key", fallback="")
 server_address = "127.0.0.1:8188"
 client_id = str(uuid.uuid4())
 
+
+def _model_to_dict(model_obj):
+    # Compatibility for both Pydantic v1 and v2.
+    if hasattr(model_obj, "model_dump"):
+        return model_obj.model_dump()
+    if hasattr(model_obj, "dict"):
+        return model_obj.dict()
+    return model_obj
+
+
+def _json_dumps_for_log(value):
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _log_request(stage: str, request_id: str, payload):
+    print(f"[FASTAPI][{request_id}][{stage}] {_json_dumps_for_log(payload)}")
+
 def resolve_public_base_url(request: Optional[Request] = None):
     cli_public_base_url = (args.public_base_url or "").strip()
     env_public_base_url = os.getenv("PUBLIC_BASE_URL", "").strip()
@@ -109,9 +129,52 @@ def get_all(prompt):
                     images_output.append(image_data)
                 output_images[node_id] = images_output
             if "response" in node_output:
-                output_text = node_output["response"][0]["content"]
+                response_payload = node_output["response"]
+                if isinstance(response_payload, list) and response_payload:
+                    first_item = response_payload[0]
+                    if isinstance(first_item, dict):
+                        output_text = str(first_item.get("content", ""))
+                    else:
+                        output_text = str(first_item)
+                elif isinstance(response_payload, str):
+                    output_text = response_payload
 
     return output_images, output_text
+
+
+def validate_api_workflow(prompt, workflow_path):
+    if not isinstance(prompt, dict):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid workflow format: {workflow_path} is not an API workflow object",
+        )
+
+    has_start_workflow = False
+    for node_id, node_data in prompt.items():
+        if not isinstance(node_data, dict):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid workflow format: node '{node_id}' is not an object. "
+                    "Please export workflow in API format."
+                ),
+            )
+        if node_data.get("class_type") == "start_workflow":
+            has_start_workflow = True
+            if not isinstance(node_data.get("inputs"), dict):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid workflow format: node '{node_id}' missing 'inputs' object",
+                )
+
+    if not has_start_workflow:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid workflow format: {workflow_path} has no start_workflow node. "
+                "Please include Start Workflow and export as API."
+            ),
+        )
 
 
 def api(
@@ -126,35 +189,76 @@ def api(
     model_name="",
     workflow_path="测试画画api.json",
     user_history="",
+    request_id="",
 ):
     global current_dir_path
     workflow_path = workflow_path
     WF_path = os.path.join(current_dir_path, "workflow_api", workflow_path)
+    _log_request(
+        "api_input",
+        request_id,
+        {
+            "workflow_path": workflow_path,
+            "workflow_file": WF_path,
+            "file_content": file_content,
+            "file_path": file_path,
+            "img_path": img_path,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "positive_prompt": positive_prompt,
+            "negative_prompt": negative_prompt,
+            "model_name": model_name,
+            "user_history": user_history,
+            "image_input_count": len(image_input) if isinstance(image_input, list) else 0,
+        },
+    )
     # 判断 WF_path 是否存在
     if not os.path.exists(WF_path):
         raise HTTPException(status_code=404, detail="Workflow file not found")
     with open(WF_path, "r", encoding="utf-8") as f:
         prompt_text = f.read()
 
-    prompt = json.loads(prompt_text)
+    try:
+        prompt = json.loads(prompt_text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid workflow JSON: {e.msg}") from e
 
-    for p in prompt:
+    validate_api_workflow(prompt, workflow_path)
+
+    for p, node_data in prompt.items():
         # 如果p的class_type是start_workflow
-        if prompt[p]["class_type"] == "start_workflow":
+        if node_data.get("class_type") == "start_workflow":
+            inputs = node_data["inputs"]
             if file_content != "":
-                prompt[p]["inputs"]["file_content"] = file_content
+                inputs["file_content"] = file_content
             if image_input is not None and image_input != []:
-                prompt[p]["inputs"]["image_input"] = image_input
-            prompt[p]["inputs"]["file_path"] = file_path
-            prompt[p]["inputs"]["img_path1"] = img_path
-            prompt[p]["inputs"]["system_prompt"] = system_prompt
-            prompt[p]["inputs"]["user_prompt"] = user_prompt
-            prompt[p]["inputs"]["positive_prompt"] = positive_prompt
-            prompt[p]["inputs"]["negative_prompt"] = negative_prompt
-            prompt[p]["inputs"]["model_name"] = model_name
-            prompt[p]["inputs"]["user_history"] = user_history
+                inputs["image_input"] = image_input
+            inputs["file_path"] = file_path
+            inputs["img_path1"] = img_path
+            inputs["system_prompt"] = system_prompt
+            inputs["user_prompt"] = user_prompt
+            inputs["positive_prompt"] = positive_prompt
+            inputs["negative_prompt"] = negative_prompt
+            inputs["model_name"] = model_name
+            inputs["user_history"] = user_history
+            _log_request(
+                "start_workflow_injected",
+                request_id,
+                {
+                    "node_id": p,
+                    "inputs": inputs,
+                },
+            )
 
     images, res = get_all(prompt)
+    _log_request(
+        "api_output",
+        request_id,
+        {
+            "image_nodes": list(images.keys()) if isinstance(images, dict) else images,
+            "response_text": res,
+        },
+    )
     return images, res
 
 
@@ -275,9 +379,21 @@ async def stream_response(response_text: str, model_name: str):
 
 @app.post("/v1/chat/completions")
 async def create_completion(request_data: CompletionRequest, request: Request, dependency=Depends(verify_api_key)):
+    request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    _log_request(
+        "incoming",
+        request_id,
+        {
+            "method": request.method,
+            "url": str(request.url),
+            "client": f"{request.client.host}:{request.client.port}" if request.client else None,
+            "headers": dict(request.headers),
+            "request_data": _model_to_dict(request_data),
+        },
+    )
     try:
         if request_data.stream:
-            response = await process_request(request_data, request)
+            response = await process_request(request_data, request, request_id=request_id)
             if isinstance(response, dict) and "choices" in response:
                 content = response["choices"][0]["message"]["content"]
                 return StreamingResponse(
@@ -285,20 +401,32 @@ async def create_completion(request_data: CompletionRequest, request: Request, d
                     media_type="text/event-stream"
                 )
         else:
-            response = await process_request(request_data, request)
+            response = await process_request(request_data, request, request_id=request_id)
         
+        _log_request("completion_response", request_id, response)
         return response
+    except HTTPException:
+        _log_request("http_exception", request_id, {"detail": "HTTPException raised"})
+        raise
     except Exception as e:
+        _log_request("unhandled_exception", request_id, {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
 
-async def process_request(request_data: CompletionRequest, request: Optional[Request] = None):
-    model_name = request_data.model
-    print(model_name)
+async def process_request(request_data: CompletionRequest, request: Optional[Request] = None, request_id: str = ""):
+    model_name = (request_data.model or "").strip()
+    if not model_name:
+        raise HTTPException(status_code=400, detail="model is required")
+    if not request_data.messages:
+        raise HTTPException(status_code=400, detail="messages is required")
+
+    _log_request("model_name", request_id, {"model_name": model_name})
     base64_encoded_list = []
     system_prompt = ""
+    user_prompt = ""
     user_histories = []
     for message in request_data.messages:
         user_histories.append({"role": message.role, "content": message.content})
+    _log_request("messages_raw", request_id, {"messages": user_histories})
     msg = request_data.messages[-1]
     if isinstance(msg.content, str):
         if msg.role == "system":
@@ -334,6 +462,16 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                                 else:
                                     raise HTTPException(status_code=400, detail="Image could not be retrieved.")
 
+    _log_request(
+        "messages_parsed",
+        request_id,
+        {
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "image_base64_count": len(base64_encoded_list),
+        },
+    )
+
     img_out = []
     for base64_encoded in base64_encoded_list:
         image_bytes = BytesIO(base64.b64decode(base64_encoded))
@@ -350,6 +488,20 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
 
     workflow_path = model_name + ".json"
     user_histories = json.dumps(user_histories, ensure_ascii=False)
+    _log_request(
+        "before_api_call",
+        request_id,
+        {
+            "workflow_path": workflow_path,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "positive_prompt": "",
+            "negative_prompt": "",
+            "model_name": "",
+            "user_histories": user_histories,
+            "image_tensor_count": len(img_out),
+        },
+    )
     images, response = api(
         "",
         img_out,
@@ -362,6 +514,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         "",
         workflow_path,
         user_histories,
+        request_id,
     )
     
     if images is None or images == []:
