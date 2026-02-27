@@ -2,6 +2,7 @@ import os
 import re
 import time
 import urllib.parse
+import mimetypes
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Optional
@@ -9,7 +10,12 @@ from typing import Optional
 import requests
 
 
-VALID_STORAGE_TYPES = {"modal", "minio", "local"}
+VALID_STORAGE_TYPES = {"modal", "minio", "local", "cos"}
+STORAGE_TYPE_ALIASES = {
+    "tencent_cos": "cos",
+    "tencent-cos": "cos",
+    "s3": "cos",
+}
 
 
 def parse_bool(value, default=False):
@@ -38,6 +44,13 @@ def _read_config(config, key, default=""):
     if config is None:
         return default
     return config.get("API_KEYS", key, fallback=default)
+
+
+def _normalize_storage_type(value: str):
+    raw = _clean(value).lower()
+    if not raw:
+        return ""
+    return STORAGE_TYPE_ALIASES.get(raw, raw)
 
 
 def _split_access_and_secret(value: str):
@@ -70,21 +83,38 @@ def _build_minio_public_base_url(public_base_url: str, endpoint: str, secure: bo
     if not base_url:
         scheme = "https" if secure else "http"
         base_url = f"{scheme}://{endpoint}".rstrip("/")
-    if bucket and not base_url.endswith(f"/{bucket}"):
+    parsed = urllib.parse.urlparse(base_url if "://" in base_url else f"http://{base_url}")
+    host = (parsed.netloc or parsed.path).lower()
+    bucket_in_host = bucket.lower() in host if bucket else False
+    if bucket and not bucket_in_host and not base_url.endswith(f"/{bucket}"):
         base_url = f"{base_url}/{bucket}"
     return base_url.rstrip("/")
 
 
-def _build_object_name(custom_filename: str, counter: int, model_name: str):
+def _infer_extension(original_filename: str = "", content_type: str = "", fallback: str = ".bin"):
+    filename = os.path.basename(_clean(original_filename))
+    _, ext = os.path.splitext(filename)
+    if ext:
+        return ext.lower()
+    mime = _clean(content_type).split(";", 1)[0].strip().lower()
+    if mime:
+        guessed = mimetypes.guess_extension(mime)
+        if guessed:
+            return guessed
+    return fallback
+
+
+def _build_object_name(custom_filename: str, counter: int, model_name: str, default_ext: str = ".png"):
     timestamp_ms = int(time.time() * 1000)
     custom_name = _clean(custom_filename)
+    default_ext = default_ext if default_ext.startswith(".") else f".{default_ext}"
     if custom_name:
         custom_name = os.path.basename(custom_name)
         base, ext = os.path.splitext(custom_name)
-        safe_base = re.sub(r"[^a-zA-Z0-9_.-]", "_", base) or "image"
-        return f"{safe_base}_{timestamp_ms}_{counter}{ext or '.png'}"
+        safe_base = re.sub(r"[^a-zA-Z0-9_.-]", "_", base) or "file"
+        return f"{safe_base}_{timestamp_ms}_{counter}{ext or default_ext}"
     safe_model_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name) or "workflow"
-    return f"{safe_model_name}_{timestamp_ms}_{counter}.png"
+    return f"{safe_model_name}_{timestamp_ms}_{counter}{default_ext}"
 
 
 @dataclass
@@ -103,7 +133,14 @@ class StorageSettings:
 class StorageBackend:
     name = "storage"
 
-    def upload(self, image_bytes: bytes, counter: int, model_name: str) -> str:
+    def upload(
+        self,
+        file_bytes: bytes,
+        counter: int,
+        model_name: str,
+        content_type: str = "application/octet-stream",
+        original_filename: str = "",
+    ) -> str:
         raise NotImplementedError
 
 
@@ -116,11 +153,19 @@ class LocalStorageBackend(StorageBackend):
         self.custom_filename = custom_filename
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def upload(self, image_bytes: bytes, counter: int, model_name: str) -> str:
-        object_name = _build_object_name(self.custom_filename, counter, model_name)
+    def upload(
+        self,
+        file_bytes: bytes,
+        counter: int,
+        model_name: str,
+        content_type: str = "application/octet-stream",
+        original_filename: str = "",
+    ) -> str:
+        ext = _infer_extension(original_filename, content_type, fallback=".bin")
+        object_name = _build_object_name(self.custom_filename, counter, model_name, default_ext=ext)
         local_file_path = os.path.join(self.output_dir, object_name)
         with open(local_file_path, "wb") as f:
-            f.write(image_bytes)
+            f.write(file_bytes)
         quoted_name = urllib.parse.quote(object_name, safe="/")
         return f"{self.public_base_url}/images/{quoted_name}"
 
@@ -135,11 +180,19 @@ class ModalStorageBackend(StorageBackend):
         self.public_base_url = public_base_url.rstrip("/")
         self.custom_filename = custom_filename
 
-    def upload(self, image_bytes: bytes, counter: int, model_name: str) -> str:
-        filename = _build_object_name(self.custom_filename, counter, model_name)
+    def upload(
+        self,
+        file_bytes: bytes,
+        counter: int,
+        model_name: str,
+        content_type: str = "application/octet-stream",
+        original_filename: str = "",
+    ) -> str:
+        ext = _infer_extension(original_filename, content_type, fallback=".bin")
+        filename = _build_object_name(self.custom_filename, counter, model_name, default_ext=ext)
         upload_url = f"{self.base_url}/api/files/upload"
         headers = {"X-API-Key": self.api_key, "X-Channel": self.channel}
-        files = {"file": (filename, image_bytes, "image/png")}
+        files = {"file": (filename, file_bytes, content_type or "application/octet-stream")}
         params = {"custom_filename": filename}
         response = requests.post(upload_url, headers=headers, files=files, params=params, timeout=120)
         if response.status_code != 200:
@@ -164,7 +217,9 @@ class MinioStorageBackend(StorageBackend):
         secure: bool,
         public_base_url: str,
         custom_filename: str = "",
+        backend_name: str = "minio",
     ):
+        self.name = backend_name
         self.endpoint = endpoint
         self.access_key = access_key
         self.secret_key = secret_key
@@ -173,13 +228,21 @@ class MinioStorageBackend(StorageBackend):
         self.public_base_url = public_base_url.rstrip("/")
         self.custom_filename = custom_filename
 
-    def upload(self, image_bytes: bytes, counter: int, model_name: str) -> str:
+    def upload(
+        self,
+        file_bytes: bytes,
+        counter: int,
+        model_name: str,
+        content_type: str = "application/octet-stream",
+        original_filename: str = "",
+    ) -> str:
         try:
             from minio import Minio
         except ImportError as exc:
             raise RuntimeError("Missing dependency: minio. Please install it first.") from exc
 
-        object_name = _build_object_name(self.custom_filename, counter, model_name)
+        ext = _infer_extension(original_filename, content_type, fallback=".bin")
+        object_name = _build_object_name(self.custom_filename, counter, model_name, default_ext=ext)
         client = Minio(
             self.endpoint,
             access_key=self.access_key,
@@ -191,13 +254,13 @@ class MinioStorageBackend(StorageBackend):
                 client.make_bucket(self.bucket)
         except Exception:
             pass
-        data_stream = BytesIO(image_bytes)
+        data_stream = BytesIO(file_bytes)
         client.put_object(
             self.bucket,
             object_name,
             data_stream,
-            length=len(image_bytes),
-            content_type="image/png",
+            length=len(file_bytes),
+            content_type=content_type or "application/octet-stream",
         )
         quoted_name = urllib.parse.quote(object_name, safe="/")
         return f"{self.public_base_url}/{quoted_name}"
@@ -213,12 +276,13 @@ def load_storage_settings(
     cli_secret_key=None,
     cli_channel=None,
     cli_custom_filename=None,
+    cli_secure=None,
 ):
-    storage_type_raw = _pick_first(
+    storage_type_raw = _normalize_storage_type(_pick_first(
         cli_type,
         os.getenv("OBJECT_STORAGE_TYPE"),
         _read_config(config, "object_storage_type"),
-    ).lower()
+    ))
 
     enabled_raw = cli_enabled
     if enabled_raw is None:
@@ -239,11 +303,11 @@ def load_storage_settings(
         return StorageSettings(enabled=False, storage_type="none", custom_filename=custom_filename)
     if not storage_type_raw:
         raise RuntimeError(
-            "Object storage is enabled but type is missing. Pass --object-storage-type modal|minio|local."
+            "Object storage is enabled but type is missing. Pass --object-storage-type modal|minio|cos|local."
         )
     if storage_type_raw not in VALID_STORAGE_TYPES:
         raise RuntimeError(
-            f"Unsupported object storage type '{storage_type_raw}'. Use one of: modal, minio, local."
+            f"Unsupported object storage type '{storage_type_raw}'. Use one of: modal, minio, cos, local."
         )
 
     if storage_type_raw == "local":
@@ -289,18 +353,21 @@ def load_storage_settings(
     base_url = _pick_first(
         cli_base_url,
         os.getenv("MINIO_ENDPOINT"),
+        os.getenv("COS_ENDPOINT"),
         os.getenv("OBJECT_STORAGE_BASE_URL"),
         _read_config(config, "object_storage_base_url"),
     )
     api_key = _pick_first(
         cli_api_key,
         os.getenv("MINIO_ACCESS_KEY"),
+        os.getenv("COS_SECRET_ID"),
         os.getenv("OBJECT_STORAGE_API_KEY"),
         _read_config(config, "object_storage_api_key"),
     )
     secret_key = _pick_first(
         cli_secret_key,
         os.getenv("MINIO_SECRET_KEY"),
+        os.getenv("COS_SECRET_KEY"),
         os.getenv("OBJECT_STORAGE_SECRET_KEY"),
         _read_config(config, "object_storage_secret_key"),
     )
@@ -309,6 +376,7 @@ def load_storage_settings(
     channel = _pick_first(
         cli_channel,
         os.getenv("MINIO_BUCKET"),
+        os.getenv("COS_BUCKET"),
         os.getenv("OBJECT_STORAGE_CHANNEL"),
         _read_config(config, "object_storage_channel", "default"),
         "default",
@@ -316,6 +384,7 @@ def load_storage_settings(
     endpoint, endpoint_is_https = _parse_minio_endpoint(base_url)
     secure = parse_bool(
         _pick_first(
+            cli_secure,
             os.getenv("MINIO_SECURE"),
             _read_config(config, "object_storage_secure"),
         ),
@@ -325,6 +394,7 @@ def load_storage_settings(
         _pick_first(
             cli_public_base_url,
             os.getenv("MINIO_PUBLIC_BASE_URL"),
+            os.getenv("COS_PUBLIC_BASE_URL"),
             os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL"),
             _read_config(config, "object_storage_public_base_url"),
         ),
@@ -334,7 +404,7 @@ def load_storage_settings(
     )
     return StorageSettings(
         enabled=True,
-        storage_type="minio",
+        storage_type=storage_type_raw,
         base_url=endpoint,
         public_base_url=public_base_url,
         api_key=api_key,
@@ -371,17 +441,18 @@ def create_storage_backend(settings: StorageSettings, output_dir: str, public_ba
             custom_filename=settings.custom_filename,
         )
 
-    if settings.storage_type == "minio":
+    if settings.storage_type in ("minio", "cos"):
+        provider = "COS" if settings.storage_type == "cos" else "MinIO"
         if not settings.base_url:
-            raise RuntimeError("MinIO storage requires endpoint in object_storage_base_url.")
+            raise RuntimeError(f"{provider} storage requires endpoint in object_storage_base_url.")
         if not settings.api_key:
-            raise RuntimeError("MinIO storage requires access key in object_storage_api_key.")
+            raise RuntimeError(f"{provider} storage requires access key in object_storage_api_key.")
         if not settings.secret_key:
-            raise RuntimeError("MinIO storage requires secret key in object_storage_secret_key.")
+            raise RuntimeError(f"{provider} storage requires secret key in object_storage_secret_key.")
         if not settings.channel:
-            raise RuntimeError("MinIO storage requires bucket in object_storage_channel.")
+            raise RuntimeError(f"{provider} storage requires bucket in object_storage_channel.")
         if not settings.public_base_url:
-            raise RuntimeError("MinIO storage requires object_storage_public_base_url or resolvable endpoint.")
+            raise RuntimeError(f"{provider} storage requires object_storage_public_base_url or resolvable endpoint.")
         return MinioStorageBackend(
             endpoint=settings.base_url,
             access_key=settings.api_key,
@@ -390,6 +461,7 @@ def create_storage_backend(settings: StorageSettings, output_dir: str, public_ba
             secure=settings.secure,
             public_base_url=settings.public_base_url,
             custom_filename=settings.custom_filename,
+            backend_name=settings.storage_type,
         )
 
     return None

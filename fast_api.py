@@ -2,6 +2,7 @@ import argparse
 import base64
 import configparser
 import json
+import mimetypes
 import os
 import re
 import time
@@ -9,7 +10,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from io import BytesIO
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -29,13 +30,19 @@ parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address 
 parser.add_argument("--port", type=int, default=8187, help="Port number to bind the server.")
 parser.add_argument("--public-base-url", type=str, default=None, help="Public base URL for image links.")
 parser.add_argument("--object-storage-enabled", type=str, default=None, help="Enable external storage: true/false.")
-parser.add_argument("--object-storage-type", type=str, default=None, help="Storage backend type: modal|minio|local.")
+parser.add_argument("--object-storage-type", type=str, default=None, help="Storage backend type: modal|minio|cos|local.")
 parser.add_argument("--object-storage-base-url", type=str, default=None, help="Storage base URL / endpoint.")
 parser.add_argument("--object-storage-public-base-url", type=str, default=None, help="Public storage URL.")
 parser.add_argument("--object-storage-api-key", type=str, default=None, help="Storage API key / access key.")
 parser.add_argument("--object-storage-secret-key", type=str, default=None, help="Storage secret key for MinIO.")
 parser.add_argument("--object-storage-channel", type=str, default=None, help="Storage channel (Modal) / bucket (MinIO).")
 parser.add_argument("--object-storage-custom-filename", type=str, default=None, help="Object storage custom filename.")
+parser.add_argument(
+    "--object-storage-default-profile",
+    type=str,
+    default=None,
+    help="Default object storage profile id used when request does not specify storage_profile.",
+)
 
 args = parser.parse_args()
 if parse_bool(args.object_storage_enabled, default=False) and not (args.object_storage_type or "").strip():
@@ -103,6 +110,221 @@ def resolve_public_base_url(request: Optional[Request] = None):
     return f"http://{args.host}:{args.port}"
 
 
+def _pick_first_non_empty(*values):
+    for value in values:
+        if value is None:
+            continue
+        cleaned = str(value).strip()
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _mask_secret(value: str):
+    raw = (value or "").strip()
+    if not raw:
+        return "<empty>"
+    if len(raw) <= 6:
+        return "*" * len(raw)
+    return f"{raw[:3]}***({len(raw)})"
+
+
+def _normalize_storage_profile(raw_profile: Dict[str, Any]):
+    if not isinstance(raw_profile, dict):
+        return {}
+
+    def pick(*keys):
+        for key in keys:
+            if key not in raw_profile:
+                continue
+            value = raw_profile.get(key)
+            if value is None:
+                continue
+            cleaned = str(value).strip()
+            if cleaned:
+                return cleaned
+        return ""
+
+    normalized = {
+        "type": pick("object_storage_type", "type"),
+        "enabled": pick("object_storage_enabled", "enabled"),
+        "base_url": pick("object_storage_base_url", "base_url"),
+        "public_base_url": pick("object_storage_public_base_url", "public_base_url"),
+        "api_key": pick("object_storage_api_key", "api_key"),
+        "secret_key": pick("object_storage_secret_key", "secret_key"),
+        "channel": pick("object_storage_channel", "channel"),
+        "custom_filename": pick("object_storage_custom_filename", "custom_filename"),
+        "secure": pick("object_storage_secure", "secure"),
+    }
+    return {k: v for k, v in normalized.items() if v != ""}
+
+
+def _load_storage_profiles_from_config(runtime_config: configparser.ConfigParser):
+    profiles = {}
+    if runtime_config is None:
+        return profiles
+    for section in runtime_config.sections():
+        if not section.upper().startswith("OBJECT_STORAGE_PROFILE."):
+            continue
+        profile_id = section.split(".", 1)[1].strip()
+        if not profile_id:
+            continue
+        profiles[profile_id] = _normalize_storage_profile(dict(runtime_config[section]))
+    return profiles
+
+
+def _load_storage_profiles_from_env():
+    profiles_json_raw = os.getenv("OBJECT_STORAGE_PROFILES_JSON", "").strip()
+    if not profiles_json_raw:
+        return {}, ""
+    try:
+        parsed = json.loads(profiles_json_raw)
+    except Exception as parse_err:
+        print(f"[FASTAPI][storage_profiles] OBJECT_STORAGE_PROFILES_JSON parse failed: {parse_err}")
+        return {}, ""
+
+    default_profile = ""
+    profile_payload = {}
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("profiles"), dict):
+            profile_payload = parsed.get("profiles", {})
+            default_profile = _pick_first_non_empty(parsed.get("default_profile"), parsed.get("default"))
+        else:
+            profile_payload = {k: v for k, v in parsed.items() if isinstance(v, dict)}
+
+    normalized_profiles = {}
+    for profile_id, profile_data in profile_payload.items():
+        profile_name = str(profile_id).strip()
+        if not profile_name:
+            continue
+        normalized = _normalize_storage_profile(profile_data)
+        if normalized:
+            normalized_profiles[profile_name] = normalized
+    return normalized_profiles, default_profile
+
+
+def resolve_storage_profile(
+    request_data,
+    request: Optional[Request],
+    runtime_config: configparser.ConfigParser,
+    request_id: str = "",
+):
+    header_profile = ""
+    if request is not None:
+        header_profile = _pick_first_non_empty(
+            request.headers.get("x-storage-profile"),
+            request.headers.get("x-object-storage-profile"),
+        )
+
+    request_profile = _pick_first_non_empty(getattr(request_data, "storage_profile", ""))
+    env_default_profile = _pick_first_non_empty(
+        args.object_storage_default_profile,
+        os.getenv("OBJECT_STORAGE_CONFIG_ID"),
+        os.getenv("OBJECT_STORAGE_DEFAULT_PROFILE"),
+    )
+    conf_default_profile = ""
+    if runtime_config is not None and runtime_config.has_section("API_KEYS"):
+        conf_default_profile = runtime_config.get("API_KEYS", "object_storage_default_profile", fallback="").strip()
+
+    env_profiles, env_profile_default = _load_storage_profiles_from_env()
+    config_profiles = _load_storage_profiles_from_config(runtime_config)
+    # Environment profiles override config profiles with the same id.
+    profiles = {**config_profiles, **env_profiles}
+
+    selected_profile = _pick_first_non_empty(
+        request_profile,
+        header_profile,
+        env_default_profile,
+        env_profile_default,
+        conf_default_profile,
+    )
+
+    overrides = {}
+    if selected_profile:
+        overrides = profiles.get(selected_profile, {})
+        _log_request(
+            "storage_profile_selected",
+            request_id,
+            {
+                "requested_profile": selected_profile,
+                "from_request_body": request_profile,
+                "from_header": header_profile,
+                "resolved": bool(overrides),
+                "available_profiles": sorted(profiles.keys()),
+            },
+        )
+    return selected_profile, overrides
+
+
+def resolve_storage_settings(
+    runtime_config: configparser.ConfigParser,
+    request_data,
+    request: Optional[Request],
+    request_id: str = "",
+):
+    profile_id, profile_overrides = resolve_storage_profile(
+        request_data=request_data,
+        request=request,
+        runtime_config=runtime_config,
+        request_id=request_id,
+    )
+
+    storage_settings = load_storage_settings(
+        runtime_config,
+        cli_type=profile_overrides.get("type", args.object_storage_type),
+        cli_enabled=profile_overrides.get("enabled", args.object_storage_enabled),
+        cli_base_url=profile_overrides.get("base_url", args.object_storage_base_url),
+        cli_public_base_url=profile_overrides.get("public_base_url", args.object_storage_public_base_url),
+        cli_api_key=profile_overrides.get("api_key", args.object_storage_api_key),
+        cli_secret_key=profile_overrides.get("secret_key", args.object_storage_secret_key),
+        cli_channel=profile_overrides.get("channel", args.object_storage_channel),
+        cli_custom_filename=profile_overrides.get("custom_filename", args.object_storage_custom_filename),
+        cli_secure=profile_overrides.get("secure"),
+    )
+
+    _log_request(
+        "storage_settings_resolved",
+        request_id,
+        {
+            "profile_id": profile_id,
+            "storage_type": storage_settings.storage_type,
+            "enabled": storage_settings.enabled,
+            "channel": storage_settings.channel,
+            "base_url": storage_settings.base_url,
+            "public_base_url": storage_settings.public_base_url,
+            "api_key": _mask_secret(storage_settings.api_key),
+            "secret_key": _mask_secret(storage_settings.secret_key),
+            "secure": storage_settings.secure,
+            "custom_filename": storage_settings.custom_filename,
+        },
+    )
+    return storage_settings, profile_id
+
+
+def guess_media_content_type(filename: str = "", format_hint: str = "", media_kind: str = ""):
+    format_clean = (format_hint or "").strip()
+    if "/" in format_clean:
+        return format_clean.split(";", 1)[0].strip().lower()
+    guessed_type, _ = mimetypes.guess_type(filename or "")
+    if guessed_type:
+        return guessed_type
+    if media_kind == "image":
+        return "image/png"
+    if media_kind == "video":
+        return "video/mp4"
+    return "application/octet-stream"
+
+
+def build_local_filename(counter: int, filename_hint: str, content_type: str, media_kind: str):
+    _, ext = os.path.splitext(filename_hint or "")
+    if not ext:
+        ext = mimetypes.guess_extension(content_type or "") or ""
+    if not ext:
+        ext = ".png" if media_kind == "image" else ".mp4" if media_kind == "video" else ".bin"
+    timestamp = int(time.time() * 1000)
+    return f"{timestamp}_{counter}{ext}"
+
+
 def queue_prompt(prompt):
     p = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(p).encode("utf-8")
@@ -110,11 +332,15 @@ def queue_prompt(prompt):
     return json.loads(urllib.request.urlopen(req).read())
 
 
-def get_image(filename, subfolder, folder_type):
+def get_asset_bytes(filename, subfolder, folder_type):
     data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
     url_values = urllib.parse.urlencode(data)
     with urllib.request.urlopen("http://{}/view?{}".format(server_address, url_values)) as response:
         return response.read()
+
+
+def get_image(filename, subfolder, folder_type):
+    return get_asset_bytes(filename, subfolder, folder_type)
 
 
 def get_history(prompt_id):
@@ -125,6 +351,7 @@ def get_history(prompt_id):
 def get_all(prompt):
     prompt_id = queue_prompt(prompt)["prompt_id"]
     output_images = {}
+    output_media = {}
     output_text = ""
 
     while True:
@@ -135,27 +362,66 @@ def get_all(prompt):
             time.sleep(0.1)
             continue
 
-    for o in history["outputs"]:
-        for node_id in history["outputs"]:
-            node_output = history["outputs"][node_id]
-            if "images" in node_output:
-                images_output = []
-                for image in node_output["images"]:
-                    image_data = get_image(image["filename"], image["subfolder"], image["type"])
-                    images_output.append(image_data)
-                output_images[node_id] = images_output
-            if "response" in node_output:
-                response_payload = node_output["response"]
-                if isinstance(response_payload, list) and response_payload:
-                    first_item = response_payload[0]
-                    if isinstance(first_item, dict):
-                        output_text = str(first_item.get("content", ""))
-                    else:
-                        output_text = str(first_item)
-                elif isinstance(response_payload, str):
-                    output_text = response_payload
+    for node_id, node_output in history.get("outputs", {}).items():
+        if not isinstance(node_output, dict):
+            continue
+        if "images" in node_output and isinstance(node_output["images"], list):
+            images_output = []
+            for image in node_output["images"]:
+                image_data = get_image(image["filename"], image["subfolder"], image["type"])
+                images_output.append(image_data)
+            output_images[node_id] = images_output
 
-    return output_images, output_text
+        media_entries = []
+        for media_key in ("videos", "gifs"):
+            media_items = node_output.get(media_key)
+            if not isinstance(media_items, list):
+                continue
+            for media_item in media_items:
+                if not isinstance(media_item, dict):
+                    continue
+                filename = media_item.get("filename")
+                if not filename:
+                    continue
+                subfolder = media_item.get("subfolder", "")
+                folder_type = media_item.get("type", "output")
+                try:
+                    media_data = get_asset_bytes(filename, subfolder, folder_type)
+                except Exception as media_err:
+                    print(f"Failed to fetch media from history: {filename}, err={media_err}")
+                    continue
+
+                content_type = guess_media_content_type(
+                    filename=filename,
+                    format_hint=media_item.get("format", ""),
+                    media_kind="video",
+                )
+                media_kind = "video"
+                if content_type.startswith("image/"):
+                    media_kind = "image"
+                media_entries.append(
+                    {
+                        "bytes": media_data,
+                        "filename": filename,
+                        "content_type": content_type,
+                        "media_kind": media_kind,
+                    }
+                )
+        if media_entries:
+            output_media[node_id] = media_entries
+
+        if "response" in node_output:
+            response_payload = node_output["response"]
+            if isinstance(response_payload, list) and response_payload:
+                first_item = response_payload[0]
+                if isinstance(first_item, dict):
+                    output_text = str(first_item.get("content", ""))
+                else:
+                    output_text = str(first_item)
+            elif isinstance(response_payload, str):
+                output_text = response_payload
+
+    return output_images, output_media, output_text
 
 
 def validate_api_workflow(prompt, workflow_path):
@@ -274,16 +540,17 @@ def api(
                 },
             )
 
-    images, res = get_all(prompt)
+    images, media, res = get_all(prompt)
     _log_request(
         "api_output",
         request_id,
         {
             "image_nodes": list(images.keys()) if isinstance(images, dict) else images,
+            "media_nodes": list(media.keys()) if isinstance(media, dict) else media,
             "response_text": res,
         },
     )
-    return images, res
+    return images, media, res
 
 
 from fastapi import FastAPI
@@ -312,6 +579,7 @@ class CompletionRequest(BaseModel):
     messages: List[Message]
     max_tokens: int = 150
     stream: bool = False
+    storage_profile: Optional[str] = None
 
 
 VALID_API_KEY = fastapi_api_key
@@ -471,6 +739,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                         elif os.path.isfile(content["image_url"]):
                             with open(content["image_url"], "rb") as image_file:
                                 base64_encoded = base64.b64encode(image_file.read()).decode("utf-8")
+                                base64_encoded_list.append(base64_encoded)
                         else:
                             # allowed_domains包含你所有的可信域名
                             # allowed_domains = ["trusteddomain.com", "anothertrusteddomain.com"]
@@ -534,7 +803,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         positive_prompt="",
         negative_prompt="",
     )
-    images, response = api(
+    images, media_outputs, response = api(
         "",
         img_out,
         "",
@@ -548,8 +817,11 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         user_histories,
         request_id,
     )
-    
-    if images is None or images == []:
+
+    has_images = isinstance(images, dict) and any(images.values())
+    has_media_outputs = isinstance(media_outputs, dict) and any(media_outputs.values())
+
+    if not has_images and not has_media_outputs:
         response_data = {
             "id": "0",
             "object": "text_completion",
@@ -567,32 +839,26 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 10},
         }
     else:
-        image_entries = []
+        media_entries = []
         config_path = os.path.join(current_dir_path, "config.ini")
-        print(config_path)
         runtime_config = configparser.ConfigParser()
         runtime_config.read(config_path, encoding="utf-8")
         api_keys = {}
         if "API_KEYS" in runtime_config:
             api_keys = runtime_config["API_KEYS"]
 
-        imgbb_key = api_keys.get("imgbb_api")
-        print(imgbb_key)
+        imgbb_key = (api_keys.get("imgbb_api") or "").strip()
         public_base_url = resolve_public_base_url(request)
         output_dir = os.path.join(current_dir_path, "output")
         os.makedirs(output_dir, exist_ok=True)
         storage_backend = None
+        storage_profile_id = ""
         try:
-            storage_settings = load_storage_settings(
-                runtime_config,
-                cli_type=args.object_storage_type,
-                cli_enabled=args.object_storage_enabled,
-                cli_base_url=args.object_storage_base_url,
-                cli_public_base_url=args.object_storage_public_base_url,
-                cli_api_key=args.object_storage_api_key,
-                cli_secret_key=args.object_storage_secret_key,
-                cli_channel=args.object_storage_channel,
-                cli_custom_filename=args.object_storage_custom_filename,
+            storage_settings, storage_profile_id = resolve_storage_settings(
+                runtime_config=runtime_config,
+                request_data=request_data,
+                request=request,
+                request_id=request_id,
             )
             storage_backend = create_storage_backend(
                 storage_settings,
@@ -603,52 +869,118 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             print(f"Storage backend init failed, fallback to local/imgbb: {backend_err}")
 
         counter = 0
-        for node_id in images:
-            for image_data in images[node_id]:
-                counter += 1
-                img_base64 = base64.b64encode(image_data).decode("utf-8")
+        def save_media(file_bytes: bytes, filename_hint: str, content_type: str, media_kind: str):
+            nonlocal counter
+            counter += 1
+            safe_filename_hint = (filename_hint or "").strip() or f"file_{counter}"
+            safe_content_type = (content_type or "").strip() or "application/octet-stream"
+            normalized_kind = media_kind if media_kind in {"image", "video"} else "file"
 
-                if storage_backend is not None:
-                    try:
-                        image_url = storage_backend.upload(image_data, counter, model_name)
-                        parsed_name = os.path.basename(urllib.parse.urlparse(image_url).path)
-                        image_filename = urllib.parse.unquote(parsed_name) or f"{int(time.time() * 1000)}_{counter}.png"
-                        image_entries.append({"url": image_url, "filename": image_filename})
-                        continue
-                    except Exception as upload_err:
-                        print(f"{storage_backend.name} upload failed, fallback to local/imgbb: {upload_err}")
+            if storage_backend is not None:
+                try:
+                    media_url = storage_backend.upload(
+                        file_bytes=file_bytes,
+                        counter=counter,
+                        model_name=model_name,
+                        content_type=safe_content_type,
+                        original_filename=safe_filename_hint,
+                    )
+                    parsed_name = os.path.basename(urllib.parse.urlparse(media_url).path)
+                    uploaded_name = urllib.parse.unquote(parsed_name) or safe_filename_hint
+                    media_entries.append(
+                        {
+                            "url": media_url,
+                            "filename": uploaded_name,
+                            "media_type": normalized_kind,
+                            "content_type": safe_content_type,
+                        }
+                    )
+                    return
+                except Exception as upload_err:
+                    print(f"{storage_backend.name} upload failed, fallback to local/imgbb: {upload_err}")
 
-                if imgbb_key is None or imgbb_key == "":
-                    timestamp = int(time.time() * 1000)
-                    filename = f"{timestamp}_{counter}.png"
-                    file_path = os.path.join(output_dir, filename)
-                    with open(file_path, "wb") as f:
-                        f.write(base64.b64decode(img_base64))
-                    image_url = f"{public_base_url}/images/{filename}"
-                    image_entries.append({"url": image_url, "filename": filename})
-                else:
+            is_image = normalized_kind == "image" or safe_content_type.startswith("image/")
+            if is_image and imgbb_key:
+                try:
+                    img_base64 = base64.b64encode(file_bytes).decode("utf-8")
                     url = "https://api.imgbb.com/1/upload"
                     payload = {"key": imgbb_key, "image": img_base64}
-                    response0 = requests.post(url, data=payload)
+                    response0 = requests.post(url, data=payload, timeout=120)
                     if response0.status_code == 200:
                         result = response0.json()
                         img_url = result["data"]["url"]
-                    else:
-                        return "Error: " + response0.text
-                    print(img_url)
-                    parsed_name = os.path.basename(urllib.parse.urlparse(img_url).path)
-                    image_filename = urllib.parse.unquote(parsed_name) or f"{int(time.time() * 1000)}_{counter}.png"
-                    image_entries.append({"url": img_url, "filename": image_filename})
-            
+                        parsed_name = os.path.basename(urllib.parse.urlparse(img_url).path)
+                        uploaded_name = urllib.parse.unquote(parsed_name) or safe_filename_hint
+                        media_entries.append(
+                            {
+                                "url": img_url,
+                                "filename": uploaded_name,
+                                "media_type": "image",
+                                "content_type": safe_content_type,
+                            }
+                        )
+                        return
+                    print(f"imgbb upload failed: status={response0.status_code}, body={response0.text}")
+                except Exception as imgbb_err:
+                    print(f"imgbb upload exception, fallback to local file: {imgbb_err}")
+
+            local_filename = build_local_filename(
+                counter=counter,
+                filename_hint=safe_filename_hint,
+                content_type=safe_content_type,
+                media_kind=normalized_kind,
+            )
+            file_path = os.path.join(output_dir, local_filename)
+            with open(file_path, "wb") as f:
+                f.write(file_bytes)
+            media_url = f"{public_base_url}/images/{urllib.parse.quote(local_filename)}"
+            media_entries.append(
+                {
+                    "url": media_url,
+                    "filename": local_filename,
+                    "media_type": normalized_kind,
+                    "content_type": safe_content_type,
+                }
+            )
+
+        for node_id in (images or {}):
+            for idx, image_data in enumerate(images[node_id], start=1):
+                filename_hint = f"image_{node_id}_{idx}.png"
+                save_media(image_data, filename_hint, "image/png", "image")
+
+        for node_id in (media_outputs or {}):
+            for idx, media_item in enumerate(media_outputs[node_id], start=1):
+                if not isinstance(media_item, dict):
+                    continue
+                file_bytes = media_item.get("bytes")
+                if not file_bytes:
+                    continue
+                filename_hint = str(media_item.get("filename") or f"media_{node_id}_{idx}").strip()
+                media_kind = str(media_item.get("media_kind") or "video").strip().lower()
+                content_type = guess_media_content_type(
+                    filename=filename_hint,
+                    format_hint=str(media_item.get("content_type") or ""),
+                    media_kind=media_kind,
+                )
+                if media_kind not in {"image", "video"}:
+                    media_kind = "image" if content_type.startswith("image/") else "video"
+                save_media(file_bytes, filename_hint, content_type, media_kind)
+
         if response is None:
             response = ""
-            
-        for image_entry in image_entries:
-            image_url = image_entry["url"]
-            image_filename = image_entry["filename"]
-            response_url = f"![{image_filename}]({image_url})"
-            response += "\n" + response_url + "\n"
-            
+
+        for media_entry in media_entries:
+            media_url = media_entry["url"]
+            media_filename = media_entry["filename"]
+            media_type = media_entry.get("media_type", "file")
+            if media_type == "image":
+                response_line = f"![{media_filename}]({media_url})"
+            elif media_type == "video":
+                response_line = f"[video:{media_filename}]({media_url})"
+            else:
+                response_line = f"[{media_filename}]({media_url})"
+            response += "\n" + response_line + "\n"
+
         print(response)
         response_data = {
             "id": "0",
@@ -664,6 +996,8 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                     "finish_reason": "stop",
                 }
             ],
+            "media": media_entries,
+            "storage_profile": storage_profile_id,
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 10},
         }
     return response_data
