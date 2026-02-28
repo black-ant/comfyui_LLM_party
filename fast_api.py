@@ -15,9 +15,7 @@ from typing import Any, Dict, List, Optional
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 import httpx
-import numpy as np
 import requests
-import torch
 import websocket
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -71,6 +69,14 @@ def _json_dumps_for_log(value):
         return json.dumps(value, ensure_ascii=False, default=str)
     except Exception:
         return str(value)
+
+
+def _is_json_serializable(value):
+    try:
+        json.dumps(value)
+        return True
+    except Exception:
+        return False
 
 
 def _log_request(stage: str, request_id: str, payload):
@@ -472,6 +478,7 @@ def api(
     workflow_path="测试画画api.json",
     user_history="",
     request_id="",
+    img_path2="",
 ):
     global current_dir_path
     workflow_path = workflow_path
@@ -485,6 +492,7 @@ def api(
             "file_content": file_content,
             "file_path": file_path,
             "img_path": img_path,
+            "img_path2": img_path2,
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "positive_prompt": positive_prompt,
@@ -522,9 +530,17 @@ def api(
             if file_content != "":
                 inputs["file_content"] = file_content
             if image_input is not None and image_input != []:
-                inputs["image_input"] = image_input
+                if _is_json_serializable(image_input):
+                    inputs["image_input"] = image_input
+                else:
+                    _log_request(
+                        "image_input_skipped_non_serializable",
+                        request_id,
+                        {"type": str(type(image_input))},
+                    )
             inputs["file_path"] = file_path
             inputs["img_path1"] = img_path
+            inputs["img_path2"] = img_path2
             inputs["system_prompt"] = system_prompt
             inputs["user_prompt"] = user_prompt
             inputs["positive_prompt"] = positive_prompt
@@ -712,7 +728,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         raise HTTPException(status_code=400, detail="messages is required")
 
     _log_request("model_name", request_id, {"model_name": model_name})
-    base64_encoded_list = []
+    raw_images_bytes = []
     system_prompt = ""
     user_prompt = ""
     user_histories = []
@@ -732,14 +748,14 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                     user_prompt = content["text"]
                 elif content["type"] == "image_url":
                     if isinstance(content["image_url"], str):
-                        if content["image_url"].startswith("data:image/png;base64,"):
-                            base64_data = content["image_url"].split("data:image/png;base64,")[1]
-                            base64_encoded_list.append(base64_data)
+                        image_url = content["image_url"]
+                        if image_url.startswith("data:image/") and ";base64," in image_url:
+                            base64_data = image_url.split(";base64,", 1)[1]
+                            raw_images_bytes.append(base64.b64decode(base64_data))
                         # 如果是本地文件路径
-                        elif os.path.isfile(content["image_url"]):
-                            with open(content["image_url"], "rb") as image_file:
-                                base64_encoded = base64.b64encode(image_file.read()).decode("utf-8")
-                                base64_encoded_list.append(base64_encoded)
+                        elif os.path.isfile(image_url):
+                            with open(image_url, "rb") as image_file:
+                                raw_images_bytes.append(image_file.read())
                         else:
                             # allowed_domains包含你所有的可信域名
                             # allowed_domains = ["trusteddomain.com", "anothertrusteddomain.com"]
@@ -747,11 +763,9 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                             # if parsed_url.netloc not in allowed_domains:
                             #     raise HTTPException(status_code=400, detail="Image URL domain is not allowed.")
                             async with httpx.AsyncClient() as client:
-                                response = await client.get(content["image_url"])
+                                response = await client.get(image_url)
                                 if response.status_code == 200:
-                                    image_bytes = BytesIO(response.content)
-                                    base64_encoded = base64.b64encode(image_bytes.read()).decode("utf-8")
-                                    base64_encoded_list.append(base64_encoded)
+                                    raw_images_bytes.append(response.content)
                                 else:
                                     raise HTTPException(status_code=400, detail="Image could not be retrieved.")
 
@@ -761,13 +775,15 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         {
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
-            "image_base64_count": len(base64_encoded_list),
+            "image_count": len(raw_images_bytes),
         },
     )
 
-    img_out = []
-    for base64_encoded in base64_encoded_list:
-        image_bytes = BytesIO(base64.b64decode(base64_encoded))
+    image_path_list = []
+    input_dir = os.path.join(current_dir_path, "input")
+    os.makedirs(input_dir, exist_ok=True)
+    for idx, raw_image_bytes in enumerate(raw_images_bytes):
+        image_bytes = BytesIO(raw_image_bytes)
         img = Image.open(image_bytes)
         img = ImageOps.exif_transpose(img)
 
@@ -775,9 +791,13 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             img = img.point(lambda i: i * (1 / 256)).convert("L")
 
         img = img.convert("RGB")
-        image_np = np.array(img).astype(np.float32) / 255.0
-        image_tensor = torch.from_numpy(image_np).permute(2, 0, 1).unsqueeze(0)
-        img_out.append(image_tensor)
+        input_filename = f"api_input_{int(time.time() * 1000)}_{request_id}_{idx + 1}.png"
+        input_path = os.path.join(input_dir, input_filename)
+        img.save(input_path, format="PNG")
+        image_path_list.append(input_path)
+
+    img_path1 = image_path_list[0] if len(image_path_list) > 0 else ""
+    img_path2 = image_path_list[1] if len(image_path_list) > 1 else ""
 
     workflow_path = model_name + ".json"
     user_histories = json.dumps(user_histories, ensure_ascii=False)
@@ -792,7 +812,9 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             "negative_prompt": "",
             "model_name": "",
             "user_histories": user_histories,
-            "image_tensor_count": len(img_out),
+            "image_count": len(image_path_list),
+            "img_path1": img_path1,
+            "img_path2": img_path2,
         },
     )
     _log_prompt_texts(
@@ -804,18 +826,19 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         negative_prompt="",
     )
     images, media_outputs, response = api(
-        "",
-        img_out,
-        "",
-        "",
-        system_prompt,
-        user_prompt,
-        "",
-        "",
-        "",
-        workflow_path,
-        user_histories,
-        request_id,
+        file_content="",
+        image_input=image_path_list,
+        file_path="",
+        img_path=img_path1,
+        img_path2=img_path2,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        positive_prompt="",
+        negative_prompt="",
+        model_name="",
+        workflow_path=workflow_path,
+        user_history=user_histories,
+        request_id=request_id,
     )
 
     has_images = isinstance(images, dict) and any(images.values())
