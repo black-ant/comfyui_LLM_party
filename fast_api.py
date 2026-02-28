@@ -53,6 +53,8 @@ config.read(os.path.join(current_dir_path, "config.ini"))
 fastapi_api_key = config.get("API_KEYS", "fastapi_api_key", fallback="")
 server_address = "127.0.0.1:8188"
 client_id = str(uuid.uuid4())
+FASTAPI_BUILD_TAG = "tensor-json-fix-2026-02-28-v2"
+FASTAPI_BUILD_COMMIT = "c3a2c91"
 
 
 def _model_to_dict(model_obj):
@@ -81,6 +83,13 @@ def _is_json_serializable(value):
 
 def _log_request(stage: str, request_id: str, payload):
     print(f"[FASTAPI][{request_id}][{stage}] {_json_dumps_for_log(payload)}")
+
+
+def _safe_preview(value: str, max_len: int = 160):
+    raw = str(value or "")
+    if len(raw) <= max_len:
+        return raw
+    return raw[:max_len] + "...(truncated)"
 
 
 def _log_prompt_texts(
@@ -527,11 +536,13 @@ def api(
         # 如果p的class_type是start_workflow
         if node_data.get("class_type") == "start_workflow":
             inputs = node_data["inputs"]
+            image_input_serializable = False
             if file_content != "":
                 inputs["file_content"] = file_content
             if image_input is not None and image_input != []:
                 if _is_json_serializable(image_input):
                     inputs["image_input"] = image_input
+                    image_input_serializable = True
                 else:
                     _log_request(
                         "image_input_skipped_non_serializable",
@@ -553,6 +564,19 @@ def api(
                 {
                     "node_id": p,
                     "inputs": inputs,
+                },
+            )
+            _log_request(
+                "start_workflow_injected_summary",
+                request_id,
+                {
+                    "node_id": p,
+                    "image_input_count": len(image_input) if isinstance(image_input, list) else 0,
+                    "image_input_serializable": image_input_serializable,
+                    "img_path1": inputs.get("img_path1", ""),
+                    "img_path2": inputs.get("img_path2", ""),
+                    "build_tag": FASTAPI_BUILD_TAG,
+                    "build_commit": FASTAPI_BUILD_COMMIT,
                 },
             )
 
@@ -584,6 +608,22 @@ app.add_middleware(
 output_dir = os.path.join(current_dir_path, "output")
 os.makedirs(output_dir, exist_ok=True)
 app.mount("/images", StaticFiles(directory=output_dir), name="images")
+
+
+@app.on_event("startup")
+async def _startup_version_log():
+    _log_request(
+        "startup_version",
+        "boot",
+        {
+            "build_tag": FASTAPI_BUILD_TAG,
+            "build_commit": FASTAPI_BUILD_COMMIT,
+            "cwd": current_dir_path,
+            "server_address": server_address,
+            "bind_host": args.host,
+            "bind_port": args.port,
+        },
+    )
 
 class Message(BaseModel):
     role: str
@@ -692,6 +732,8 @@ async def create_completion(request_data: CompletionRequest, request: Request, d
         "incoming",
         request_id,
         {
+            "build_tag": FASTAPI_BUILD_TAG,
+            "build_commit": FASTAPI_BUILD_COMMIT,
             "method": request.method,
             "url": str(request.url),
             "client": f"{request.client.host}:{request.client.port}" if request.client else None,
@@ -729,6 +771,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
 
     _log_request("model_name", request_id, {"model_name": model_name})
     raw_images_bytes = []
+    image_sources = []
     system_prompt = ""
     user_prompt = ""
     user_histories = []
@@ -752,10 +795,17 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                         if image_url.startswith("data:image/") and ";base64," in image_url:
                             base64_data = image_url.split(";base64,", 1)[1]
                             raw_images_bytes.append(base64.b64decode(base64_data))
+                            image_sources.append({"source_type": "data_uri"})
                         # 如果是本地文件路径
                         elif os.path.isfile(image_url):
                             with open(image_url, "rb") as image_file:
                                 raw_images_bytes.append(image_file.read())
+                            image_sources.append(
+                                {
+                                    "source_type": "local_file",
+                                    "path": _safe_preview(image_url),
+                                }
+                            )
                         else:
                             # allowed_domains包含你所有的可信域名
                             # allowed_domains = ["trusteddomain.com", "anothertrusteddomain.com"]
@@ -766,6 +816,14 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                                 response = await client.get(image_url)
                                 if response.status_code == 200:
                                     raw_images_bytes.append(response.content)
+                                    parsed = urllib.parse.urlparse(image_url)
+                                    image_sources.append(
+                                        {
+                                            "source_type": "remote_url",
+                                            "url_host": parsed.netloc,
+                                            "url_path": _safe_preview(parsed.path),
+                                        }
+                                    )
                                 else:
                                     raise HTTPException(status_code=400, detail="Image could not be retrieved.")
 
@@ -776,6 +834,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
             "image_count": len(raw_images_bytes),
+            "image_sources": image_sources,
         },
     )
 
@@ -798,6 +857,16 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
 
     img_path1 = image_path_list[0] if len(image_path_list) > 0 else ""
     img_path2 = image_path_list[1] if len(image_path_list) > 1 else ""
+    _log_request(
+        "image_pipeline",
+        request_id,
+        {
+            "saved_input_count": len(image_path_list),
+            "img_path1": img_path1,
+            "img_path2": img_path2,
+            "all_paths": image_path_list,
+        },
+    )
 
     workflow_path = model_name + ".json"
     user_histories = json.dumps(user_histories, ensure_ascii=False)
