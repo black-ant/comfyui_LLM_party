@@ -57,6 +57,18 @@ FASTAPI_BUILD_TAG = "tensor-json-fix-2026-02-28-v2"
 FASTAPI_BUILD_COMMIT = "c3a2c91"
 
 
+def _get_stream_heartbeat_seconds():
+    raw_value = os.getenv("FASTAPI_STREAM_HEARTBEAT_SEC", "10").strip()
+    try:
+        heartbeat_seconds = float(raw_value)
+    except ValueError:
+        heartbeat_seconds = 10.0
+    return max(1.0, heartbeat_seconds)
+
+
+STREAM_HEARTBEAT_SECONDS = _get_stream_heartbeat_seconds()
+
+
 def _model_to_dict(model_obj):
     # Compatibility for both Pydantic v1 and v2.
     if hasattr(model_obj, "model_dump"):
@@ -743,13 +755,14 @@ async def create_completion(request_data: CompletionRequest, request: Request, d
     )
     try:
         if request_data.stream:
-            response = await process_request(request_data, request, request_id=request_id)
-            if isinstance(response, dict) and "choices" in response:
-                content = response["choices"][0]["message"]["content"]
-                return StreamingResponse(
-                    stream_response(content, request_data.model),
-                    media_type="text/event-stream"
-                )
+            return StreamingResponse(
+                stream_completion_with_heartbeat(request_data, request, request_id=request_id),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         else:
             response = await process_request(request_data, request, request_id=request_id)
         
@@ -761,6 +774,45 @@ async def create_completion(request_data: CompletionRequest, request: Request, d
     except Exception as e:
         _log_request("unhandled_exception", request_id, {"error": str(e)})
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _extract_content_from_completion(response):
+    if not isinstance(response, dict):
+        return str(response or "")
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices:
+        message = choices[0].get("message", {})
+        if isinstance(message, dict):
+            return str(message.get("content", ""))
+    return str(response)
+
+
+async def stream_completion_with_heartbeat(request_data: CompletionRequest, request: Request, request_id: str):
+    task = asyncio.create_task(process_request(request_data, request, request_id=request_id))
+    while True:
+        try:
+            response = await asyncio.wait_for(asyncio.shield(task), timeout=STREAM_HEARTBEAT_SECONDS)
+            break
+        except asyncio.TimeoutError:
+            # SSE comment frame as heartbeat to keep upstream/proxy connection active.
+            yield ": keep-alive\n\n"
+        except Exception as exc:
+            _log_request("stream_error", request_id, {"error": str(exc)})
+            error_payload = {
+                "id": "chatcmpl-" + str(uuid.uuid4()),
+                "object": "error",
+                "created": int(time.time()),
+                "model": request_data.model,
+                "error": {"message": str(exc)},
+            }
+            yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+    _log_request("completion_response", request_id, response)
+    content = _extract_content_from_completion(response)
+    async for chunk in stream_response(content, request_data.model):
+        yield chunk
 
 async def process_request(request_data: CompletionRequest, request: Optional[Request] = None, request_id: str = ""):
     model_name = (request_data.model or "").strip()
@@ -894,7 +946,8 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         positive_prompt="",
         negative_prompt="",
     )
-    images, media_outputs, response = api(
+    images, media_outputs, response = await asyncio.to_thread(
+        api,
         file_content="",
         image_input=image_path_list,
         file_path="",
