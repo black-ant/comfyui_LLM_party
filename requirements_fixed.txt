@@ -67,3 +67,4 @@ docstring_parser
 langchain_ollama
 timm
 minio
+boto3
