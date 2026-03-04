@@ -67,6 +67,17 @@ def _get_stream_heartbeat_seconds():
 
 
 STREAM_HEARTBEAT_SECONDS = _get_stream_heartbeat_seconds()
+VIDEO_FILE_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".webm",
+    ".m4v",
+    ".wmv",
+    ".flv",
+}
+URL_REGEX = re.compile(r"https?://[^\s)>\"]+")
 
 
 def _model_to_dict(model_obj):
@@ -342,6 +353,59 @@ def guess_media_content_type(filename: str = "", format_hint: str = "", media_ki
     return "application/octet-stream"
 
 
+def infer_media_kind(filename: str = "", format_hint: str = "", default_kind: str = "image"):
+    content_type = guess_media_content_type(
+        filename=filename,
+        format_hint=format_hint,
+        media_kind=default_kind,
+    )
+    ext = os.path.splitext((filename or "").lower())[1]
+    if content_type.startswith("video/") or ext in VIDEO_FILE_EXTENSIONS:
+        return "video", content_type
+    if content_type.startswith("image/"):
+        return "image", content_type
+    if default_kind == "video":
+        return "video", content_type
+    return "image", content_type
+
+
+def extract_urls_from_text(text: str):
+    raw_text = str(text or "")
+    matches = URL_REGEX.findall(raw_text)
+    deduped = []
+    seen = set()
+    for item in matches:
+        candidate = item.rstrip(".,;:!?")
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            deduped.append(candidate)
+    return deduped
+
+
+def is_probable_video_url(url: str):
+    candidate = str(url or "").strip()
+    if not candidate:
+        return False
+    parsed = urllib.parse.urlparse(candidate)
+    path = (parsed.path or "").lower()
+    ext = os.path.splitext(path)[1]
+    if ext in VIDEO_FILE_EXTENSIONS:
+        return True
+    # Fallback for common video-style links without file extension.
+    lowered = candidate.lower()
+    return any(marker in lowered for marker in ("/video", "video=", "media_type=video"))
+
+
+def is_probable_image_url(url: str):
+    candidate = str(url or "").strip()
+    if not candidate:
+        return False
+    parsed = urllib.parse.urlparse(candidate)
+    path = (parsed.path or "").lower()
+    ext = os.path.splitext(path)[1]
+    return ext in {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
+
+
 def build_local_filename(counter: int, filename_hint: str, content_type: str, media_kind: str):
     _, ext = os.path.splitext(filename_hint or "")
     if not ext:
@@ -375,7 +439,7 @@ def get_history(prompt_id):
         return json.loads(response.read())
 
 
-def get_all(prompt):
+def get_all(prompt, request_id: str = ""):
     prompt_id = queue_prompt(prompt)["prompt_id"]
     output_images = {}
     output_media = {}
@@ -392,14 +456,55 @@ def get_all(prompt):
     for node_id, node_output in history.get("outputs", {}).items():
         if not isinstance(node_output, dict):
             continue
-        if "images" in node_output and isinstance(node_output["images"], list):
-            images_output = []
-            for image in node_output["images"]:
-                image_data = get_image(image["filename"], image["subfolder"], image["type"])
-                images_output.append(image_data)
-            output_images[node_id] = images_output
+        node_output_keys = list(node_output.keys())
+        _log_request(
+            "history_node_output_keys",
+            request_id,
+            {"node_id": node_id, "keys": node_output_keys},
+        )
 
         media_entries = []
+        image_assets = []
+        seen_assets = set()
+        if "images" in node_output and isinstance(node_output["images"], list):
+            for image in node_output["images"]:
+                if not isinstance(image, dict):
+                    continue
+                filename = image.get("filename")
+                if not filename:
+                    continue
+                subfolder = image.get("subfolder", "")
+                folder_type = image.get("type", "output")
+                asset_key = (filename, subfolder, folder_type)
+                if asset_key in seen_assets:
+                    continue
+                seen_assets.add(asset_key)
+
+                try:
+                    asset_data = get_asset_bytes(filename, subfolder, folder_type)
+                except Exception as image_err:
+                    print(f"Failed to fetch image/media from history: {filename}, err={image_err}")
+                    continue
+
+                media_kind, content_type = infer_media_kind(
+                    filename=filename,
+                    format_hint=image.get("format", ""),
+                    default_kind="image",
+                )
+                if media_kind == "video":
+                    media_entries.append(
+                        {
+                            "bytes": asset_data,
+                            "filename": filename,
+                            "content_type": content_type,
+                            "media_kind": "video",
+                        }
+                    )
+                else:
+                    image_assets.append(asset_data)
+            if image_assets:
+                output_images[node_id] = image_assets
+
         for media_key in ("videos", "gifs"):
             media_items = node_output.get(media_key)
             if not isinstance(media_items, list):
@@ -412,20 +517,21 @@ def get_all(prompt):
                     continue
                 subfolder = media_item.get("subfolder", "")
                 folder_type = media_item.get("type", "output")
+                asset_key = (filename, subfolder, folder_type)
+                if asset_key in seen_assets:
+                    continue
+                seen_assets.add(asset_key)
                 try:
                     media_data = get_asset_bytes(filename, subfolder, folder_type)
                 except Exception as media_err:
                     print(f"Failed to fetch media from history: {filename}, err={media_err}")
                     continue
 
-                content_type = guess_media_content_type(
+                media_kind, content_type = infer_media_kind(
                     filename=filename,
                     format_hint=media_item.get("format", ""),
-                    media_kind="video",
+                    default_kind="video",
                 )
-                media_kind = "video"
-                if content_type.startswith("image/"):
-                    media_kind = "image"
                 media_entries.append(
                     {
                         "bytes": media_data,
@@ -448,6 +554,15 @@ def get_all(prompt):
             elif isinstance(response_payload, str):
                 output_text = response_payload
 
+    _log_request(
+        "history_output_summary",
+        request_id,
+        {
+            "prompt_id": prompt_id,
+            "image_nodes": list(output_images.keys()),
+            "media_nodes": list(output_media.keys()),
+        },
+    )
     return output_images, output_media, output_text
 
 
@@ -592,7 +707,7 @@ def api(
                 },
             )
 
-    images, media, res = get_all(prompt)
+    images, media, res = get_all(prompt, request_id=request_id)
     _log_request(
         "api_output",
         request_id,
@@ -718,24 +833,34 @@ async def stream_response(response_text: str, model_name: str):
         chunks.append(" ".join(current_chunk))
 
     for i, chunk in enumerate(chunks):
-        response_chunk = {
-            "id": "chatcmpl-" + str(uuid.uuid4()),
-            "object": "chat.completion.chunk",
-            "created": int(time.time()),
-            "model": model_name,
-            "choices": [{
-                "delta": {
-                    "role": "assistant" if i == 0 else None,
-                    "content": chunk
-                },
-                "index": 0,
-                "finish_reason": "stop" if i == len(chunks) - 1 else None
-            }]
-        }
-        yield f"data: {json.dumps(response_chunk)}\n\n"
+        delta = {"content": chunk}
+        if i == 0:
+            delta["role"] = "assistant"
+        yield _build_stream_sse_frame(
+            model_name=model_name,
+            delta=delta,
+            finish_reason="stop" if i == len(chunks) - 1 else None,
+        )
         await asyncio.sleep(0.1)  # Add small delay between chunks
     
     yield "data: [DONE]\n\n"
+
+
+def _build_stream_sse_frame(model_name: str, delta: Optional[Dict[str, Any]] = None, finish_reason: Optional[str] = None):
+    payload = {
+        "id": "chatcmpl-" + str(uuid.uuid4()),
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model_name,
+        "choices": [
+            {
+                "delta": delta or {},
+                "index": 0,
+                "finish_reason": finish_reason,
+            }
+        ],
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 @app.post("/v1/chat/completions")
 async def create_completion(request_data: CompletionRequest, request: Request, dependency=Depends(verify_api_key)):
@@ -789,13 +914,19 @@ def _extract_content_from_completion(response):
 
 async def stream_completion_with_heartbeat(request_data: CompletionRequest, request: Request, request_id: str):
     task = asyncio.create_task(process_request(request_data, request, request_id=request_id))
+    # Send an immediate empty chunk so intermediaries receive bytes quickly.
+    yield _build_stream_sse_frame(model_name=request_data.model, delta={})
     while True:
         try:
             response = await asyncio.wait_for(asyncio.shield(task), timeout=STREAM_HEARTBEAT_SECONDS)
             break
         except asyncio.TimeoutError:
-            # SSE comment frame as heartbeat to keep upstream/proxy connection active.
+            if await request.is_disconnected():
+                task.cancel()
+                return
+            # Keep both comment-frame and data-frame heartbeats for proxy compatibility.
             yield ": keep-alive\n\n"
+            yield _build_stream_sse_frame(model_name=request_data.model, delta={})
         except Exception as exc:
             _log_request("stream_error", request_id, {"error": str(exc)})
             error_payload = {
@@ -841,9 +972,25 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             if isinstance(content, dict) and "type" in content:
                 if content["type"] == "text":
                     user_prompt = content["text"]
-                elif content["type"] == "image_url":
-                    if isinstance(content["image_url"], str):
-                        image_url = content["image_url"]
+                elif content["type"] in {
+                    "image_url",
+                    "first_frame",
+                    "first_frame_image",
+                    "last_frame",
+                    "last_frame_image",
+                    "end_frame",
+                    "end_frame_image",
+                }:
+                    image_field = content.get("image_url")
+                    image_url = ""
+                    if isinstance(image_field, str):
+                        image_url = image_field
+                    elif isinstance(image_field, dict):
+                        image_url = str(image_field.get("url") or "").strip()
+                    elif isinstance(content.get("url"), str):
+                        image_url = str(content.get("url") or "").strip()
+
+                    if image_url:
                         if image_url.startswith("data:image/") and ";base64," in image_url:
                             base64_data = image_url.split(";base64,", 1)[1]
                             raw_images_bytes.append(base64.b64decode(base64_data))
@@ -878,6 +1025,11 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                                     )
                                 else:
                                     raise HTTPException(status_code=400, detail="Image could not be retrieved.")
+                    else:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="image_url/first_frame/last_frame must be a string URL or object with image_url.url",
+                        )
 
     _log_request(
         "messages_parsed",
@@ -966,7 +1118,16 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
     has_images = isinstance(images, dict) and any(images.values())
     has_media_outputs = isinstance(media_outputs, dict) and any(media_outputs.values())
 
+    if response is None:
+        response = ""
+
     if not has_images and not has_media_outputs:
+        parsed_urls = extract_urls_from_text(response)
+        parsed_video_urls = [url for url in parsed_urls if is_probable_video_url(url)]
+        parsed_image_urls = [url for url in parsed_urls if is_probable_image_url(url)]
+        parsed_file_urls = [
+            url for url in parsed_urls if url not in parsed_video_urls and url not in parsed_image_urls
+        ]
         response_data = {
             "id": "0",
             "object": "text_completion",
@@ -981,6 +1142,13 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                     "finish_reason": "stop",
                 }
             ],
+            "media": [],
+            "video_url": parsed_video_urls[0] if parsed_video_urls else "",
+            "video_urls": parsed_video_urls,
+            "image_url": parsed_image_urls[0] if parsed_image_urls else "",
+            "image_urls": parsed_image_urls,
+            "file_urls": parsed_file_urls,
+            "storage_profile": "",
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 10},
         }
     else:
@@ -1088,11 +1256,6 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                 }
             )
 
-        for node_id in (images or {}):
-            for idx, image_data in enumerate(images[node_id], start=1):
-                filename_hint = f"image_{node_id}_{idx}.png"
-                save_media(image_data, filename_hint, "image/png", "image")
-
         for node_id in (media_outputs or {}):
             for idx, media_item in enumerate(media_outputs[node_id], start=1):
                 if not isinstance(media_item, dict):
@@ -1111,8 +1274,10 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                     media_kind = "image" if content_type.startswith("image/") else "video"
                 save_media(file_bytes, filename_hint, content_type, media_kind)
 
-        if response is None:
-            response = ""
+        for node_id in (images or {}):
+            for idx, image_data in enumerate(images[node_id], start=1):
+                filename_hint = f"image_{node_id}_{idx}.png"
+                save_media(image_data, filename_hint, "image/png", "image")
 
         for media_entry in media_entries:
             media_url = media_entry["url"]
@@ -1127,6 +1292,24 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
             response += "\n" + response_line + "\n"
 
         print(response)
+        video_urls = [entry["url"] for entry in media_entries if entry.get("media_type") == "video"]
+        image_urls = [entry["url"] for entry in media_entries if entry.get("media_type") == "image"]
+        file_urls = [
+            entry["url"]
+            for entry in media_entries
+            if entry.get("media_type") not in {"image", "video"}
+        ]
+        # Ensure schema-stable URL fields even when media entries are incomplete.
+        if not video_urls or not image_urls:
+            parsed_urls = extract_urls_from_text(response)
+            if not video_urls:
+                video_urls = [url for url in parsed_urls if is_probable_video_url(url)]
+            if not image_urls:
+                image_urls = [url for url in parsed_urls if is_probable_image_url(url)]
+            if not file_urls:
+                file_urls = [
+                    url for url in parsed_urls if url not in video_urls and url not in image_urls
+                ]
         response_data = {
             "id": "0",
             "object": "text_completion",
@@ -1142,9 +1325,15 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                 }
             ],
             "media": media_entries,
+            "video_url": video_urls[0] if video_urls else "",
+            "video_urls": video_urls,
+            "image_url": image_urls[0] if image_urls else "",
+            "image_urls": image_urls,
+            "file_urls": file_urls,
             "storage_profile": storage_profile_id,
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 10},
         }
+    _log_request("response_payload_full", request_id, response_data)
     return response_data
 
 
