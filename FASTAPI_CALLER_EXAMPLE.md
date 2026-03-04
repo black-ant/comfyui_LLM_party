@@ -45,7 +45,7 @@ curl -X POST "http://127.0.0.1:8187/v1/chat/completions" \
     {
       "message": {
         "role": "assistant",
-        "content": "\n[video:video_1772599999000_1.mp4](https://cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4)\n"
+        "content": "\n[video:video_1772599999000_1.mp4](https://bucket-appid.cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4)\n"
       },
       "index": 0,
       "logprobs": null,
@@ -54,15 +54,15 @@ curl -X POST "http://127.0.0.1:8187/v1/chat/completions" \
   ],
   "media": [
     {
-      "url": "https://cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4",
+      "url": "https://bucket-appid.cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4",
       "filename": "video_1772599999000_1.mp4",
       "media_type": "video",
       "content_type": "video/mp4"
     }
   ],
-  "video_url": "https://cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4",
+  "video_url": "https://bucket-appid.cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4",
   "video_urls": [
-    "https://cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4"
+    "https://bucket-appid.cos.ap-singapore.myqcloud.com/video_1772599999000_1.mp4"
   ],
   "image_url": "",
   "image_urls": [],

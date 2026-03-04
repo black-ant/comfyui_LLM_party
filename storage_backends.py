@@ -116,6 +116,56 @@ def _detect_object_storage_provider(endpoint: str, explicit_provider: str = "aut
     return "minio"
 
 
+def _is_probable_vendor_endpoint(host: str, provider: str):
+    host_lower = _clean(host).lower()
+    if not host_lower:
+        return False
+    if provider == "cos":
+        return host_lower.startswith("cos.") or ".cos." in host_lower or host_lower.endswith(".myqcloud.com")
+    if provider == "s3":
+        return host_lower.startswith("s3.") or ".s3." in host_lower or "amazonaws.com" in host_lower
+    return False
+
+
+def _ensure_bucket_in_public_base_url(
+    public_base_url: str,
+    endpoint: str,
+    secure: bool,
+    bucket: str,
+    provider: str,
+):
+    normalized_base = _clean(public_base_url).rstrip("/")
+    normalized_bucket = _clean(bucket)
+    normalized_provider = _normalize_provider(provider)
+    if not normalized_base or not normalized_bucket or normalized_provider not in {"cos", "s3"}:
+        return normalized_base
+
+    default_scheme = "https" if secure else "http"
+    parse_target = normalized_base if "://" in normalized_base else f"{default_scheme}://{normalized_base.lstrip('/')}"
+    parsed = urllib.parse.urlparse(parse_target)
+    host = (parsed.netloc or "").strip()
+    if not host:
+        return normalized_base
+
+    bucket_lower = normalized_bucket.lower()
+    if host.lower().startswith(f"{bucket_lower}."):
+        return normalized_base
+
+    path_segments = [segment for segment in parsed.path.split("/") if segment]
+    if path_segments and path_segments[0].lower() == bucket_lower:
+        return normalized_base
+
+    endpoint_host, _, _ = _parse_object_storage_endpoint(endpoint)
+    host_is_endpoint = bool(endpoint_host) and host.lower() == endpoint_host.lower()
+    if not host_is_endpoint and not _is_probable_vendor_endpoint(host, normalized_provider):
+        return normalized_base
+
+    rebuilt = urllib.parse.urlunparse(
+        (parsed.scheme or default_scheme, f"{normalized_bucket}.{host}", "", "", "", "")
+    )
+    return rebuilt.rstrip("/")
+
+
 def _build_object_storage_public_base_url(
     public_base_url: str,
     endpoint: str,
@@ -124,14 +174,20 @@ def _build_object_storage_public_base_url(
     provider: str,
 ):
     base_url = _clean(public_base_url).rstrip("/")
+    provider = _normalize_provider(provider)
     if base_url:
-        return base_url
+        return _ensure_bucket_in_public_base_url(
+            public_base_url=base_url,
+            endpoint=endpoint,
+            secure=secure,
+            bucket=bucket,
+            provider=provider,
+        )
     if not endpoint:
         return ""
 
     scheme = "https" if secure else "http"
     host = endpoint.rstrip("/")
-    provider = _normalize_provider(provider)
     if provider in {"cos", "s3"}:
         bucket_lower = bucket.lower()
         if bucket and not host.lower().startswith(f"{bucket_lower}."):
