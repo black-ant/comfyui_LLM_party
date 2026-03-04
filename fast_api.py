@@ -36,6 +36,18 @@ parser.add_argument("--object-storage-secret-key", type=str, default=None, help=
 parser.add_argument("--object-storage-channel", type=str, default=None, help="Storage channel (Modal) / bucket (MinIO).")
 parser.add_argument("--object-storage-custom-filename", type=str, default=None, help="Object storage custom filename.")
 parser.add_argument(
+    "--object-storage-provider",
+    type=str,
+    default=None,
+    help="Storage provider strategy: auto|minio|cos|s3|modal|local.",
+)
+parser.add_argument(
+    "--object-storage-region",
+    type=str,
+    default=None,
+    help="Optional object storage region (for COS/S3 compatible backends).",
+)
+parser.add_argument(
     "--object-storage-default-profile",
     type=str,
     default=None,
@@ -43,12 +55,31 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
-if parse_bool(args.object_storage_enabled, default=False) and not (args.object_storage_type or "").strip():
-    parser.error("--object-storage-type is required when --object-storage-enabled=true")
-
 current_dir_path = os.path.dirname(os.path.realpath(__file__))
 config = configparser.ConfigParser()
 config.read(os.path.join(current_dir_path, "config.ini"))
+if parse_bool(args.object_storage_enabled, default=False):
+    configured_type = (
+        (args.object_storage_type or "").strip()
+        or os.getenv("OBJECT_STORAGE_TYPE", "").strip()
+        or config.get("API_KEYS", "object_storage_type", fallback="").strip()
+    )
+    configured_provider = (
+        (args.object_storage_provider or "").strip()
+        or os.getenv("OBJECT_STORAGE_PROVIDER", "").strip()
+        or config.get("API_KEYS", "object_storage_provider", fallback="").strip()
+    )
+    configured_base_url = (
+        (args.object_storage_base_url or "").strip()
+        or os.getenv("OBJECT_STORAGE_BASE_URL", "").strip()
+        or os.getenv("MINIO_ENDPOINT", "").strip()
+        or os.getenv("MODAL_OBJECT_STORAGE_BASE_URL", "").strip()
+        or config.get("API_KEYS", "object_storage_base_url", fallback="").strip()
+    )
+    if not configured_type and not configured_provider and not configured_base_url:
+        parser.error(
+            "--object-storage-type or --object-storage-provider or --object-storage-base-url is required when --object-storage-enabled=true"
+        )
 # 获取配置文件中的参数
 fastapi_api_key = config.get("API_KEYS", "fastapi_api_key", fallback="")
 server_address = "127.0.0.1:8188"
@@ -186,6 +217,8 @@ def _normalize_storage_profile(raw_profile: Dict[str, Any]):
     normalized = {
         "type": pick("object_storage_type", "type"),
         "enabled": pick("object_storage_enabled", "enabled"),
+        "provider": pick("object_storage_provider", "provider"),
+        "region": pick("object_storage_region", "region"),
         "base_url": pick("object_storage_base_url", "base_url"),
         "public_base_url": pick("object_storage_public_base_url", "public_base_url"),
         "api_key": pick("object_storage_api_key", "api_key"),
@@ -311,6 +344,8 @@ def resolve_storage_settings(
         runtime_config,
         cli_type=profile_overrides.get("type", args.object_storage_type),
         cli_enabled=profile_overrides.get("enabled", args.object_storage_enabled),
+        cli_provider=profile_overrides.get("provider", args.object_storage_provider),
+        cli_region=profile_overrides.get("region", args.object_storage_region),
         cli_base_url=profile_overrides.get("base_url", args.object_storage_base_url),
         cli_public_base_url=profile_overrides.get("public_base_url", args.object_storage_public_base_url),
         cli_api_key=profile_overrides.get("api_key", args.object_storage_api_key),
@@ -326,6 +361,8 @@ def resolve_storage_settings(
         {
             "profile_id": profile_id,
             "storage_type": storage_settings.storage_type,
+            "provider": getattr(storage_settings, "provider", ""),
+            "region": getattr(storage_settings, "region", ""),
             "enabled": storage_settings.enabled,
             "channel": storage_settings.channel,
             "base_url": storage_settings.base_url,

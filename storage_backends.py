@@ -1,8 +1,8 @@
+import mimetypes
 import os
 import re
 import time
 import urllib.parse
-import mimetypes
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Optional
@@ -10,11 +10,13 @@ from typing import Optional
 import requests
 
 
-VALID_STORAGE_TYPES = {"modal", "minio", "local", "cos"}
+VALID_STORAGE_TYPES = {"modal", "minio", "local", "cos", "auto"}
+VALID_STORAGE_PROVIDERS = {"auto", "modal", "minio", "s3", "cos", "local"}
 STORAGE_TYPE_ALIASES = {
     "tencent_cos": "cos",
     "tencent-cos": "cos",
-    "s3": "cos",
+    "aws_s3": "s3",
+    "amazon_s3": "s3",
 }
 
 
@@ -23,7 +25,10 @@ def parse_bool(value, default=False):
         return default
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    raw = str(value).strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _clean(value):
@@ -53,6 +58,23 @@ def _normalize_storage_type(value: str):
     return STORAGE_TYPE_ALIASES.get(raw, raw)
 
 
+def _normalize_provider(provider: str):
+    raw = _clean(provider).lower()
+    if not raw:
+        return "auto"
+    aliases = {
+        "tencent_cos": "cos",
+        "tencent-cos": "cos",
+        "qcloud_cos": "cos",
+        "aws_s3": "s3",
+        "amazon_s3": "s3",
+    }
+    normalized = aliases.get(raw, raw)
+    if normalized not in VALID_STORAGE_PROVIDERS:
+        return "auto"
+    return normalized
+
+
 def _split_access_and_secret(value: str):
     raw = _clean(value)
     if not raw:
@@ -64,31 +86,60 @@ def _split_access_and_secret(value: str):
     return raw, ""
 
 
-def _parse_minio_endpoint(endpoint_url: str):
+def _parse_object_storage_endpoint(endpoint_url: str):
     raw = _clean(endpoint_url)
     if not raw:
-        return "", False
+        return "", False, ""
     normalized = raw if "://" in raw else f"http://{raw}"
     parsed = urllib.parse.urlparse(normalized)
     endpoint = (parsed.netloc or parsed.path).strip().strip("/")
+    path_hint = parsed.path.strip("/").split("/", 1)[0] if parsed.path and parsed.path.strip("/") else ""
     if "/" in endpoint:
         endpoint = endpoint.split("/", 1)[0]
-    return endpoint, parsed.scheme == "https"
+    return endpoint, parsed.scheme == "https", path_hint
 
 
-def _build_minio_public_base_url(public_base_url: str, endpoint: str, secure: bool, bucket: str):
+def _detect_object_storage_provider(endpoint: str, explicit_provider: str = "auto", storage_type_hint: str = ""):
+    hint = _normalize_storage_type(storage_type_hint)
+    if hint == "cos":
+        return "cos"
+    provider = _normalize_provider(explicit_provider)
+    if provider != "auto":
+        return provider
+    host = _clean(endpoint).lower()
+    if not host:
+        return "minio"
+    if ".myqcloud.com" in host or host.startswith("cos.") or ".cos." in host:
+        return "cos"
+    if "amazonaws.com" in host or host.startswith("s3.") or ".s3." in host:
+        return "s3"
+    return "minio"
+
+
+def _build_object_storage_public_base_url(
+    public_base_url: str,
+    endpoint: str,
+    secure: bool,
+    bucket: str,
+    provider: str,
+):
     base_url = _clean(public_base_url).rstrip("/")
-    if not base_url and not endpoint:
+    if base_url:
+        return base_url
+    if not endpoint:
         return ""
-    if not base_url:
-        scheme = "https" if secure else "http"
-        base_url = f"{scheme}://{endpoint}".rstrip("/")
-    parsed = urllib.parse.urlparse(base_url if "://" in base_url else f"http://{base_url}")
-    host = (parsed.netloc or parsed.path).lower()
-    bucket_in_host = bucket.lower() in host if bucket else False
-    if bucket and not bucket_in_host and not base_url.endswith(f"/{bucket}"):
-        base_url = f"{base_url}/{bucket}"
-    return base_url.rstrip("/")
+
+    scheme = "https" if secure else "http"
+    host = endpoint.rstrip("/")
+    provider = _normalize_provider(provider)
+    if provider in {"cos", "s3"}:
+        bucket_lower = bucket.lower()
+        if bucket and not host.lower().startswith(f"{bucket_lower}."):
+            host = f"{bucket}.{host}"
+        return f"{scheme}://{host}".rstrip("/")
+    if bucket:
+        return f"{scheme}://{host}/{bucket}".rstrip("/")
+    return f"{scheme}://{host}".rstrip("/")
 
 
 def _infer_extension(original_filename: str = "", content_type: str = "", fallback: str = ".bin"):
@@ -128,6 +179,8 @@ class StorageSettings:
     channel: str = ""
     custom_filename: str = ""
     secure: bool = False
+    provider: str = "auto"
+    region: str = ""
 
 
 class StorageBackend:
@@ -266,6 +319,106 @@ class MinioStorageBackend(StorageBackend):
         return f"{self.public_base_url}/{quoted_name}"
 
 
+class S3CompatibleStorageBackend(StorageBackend):
+    name = "s3"
+
+    def __init__(
+        self,
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        bucket: str,
+        secure: bool,
+        public_base_url: str,
+        custom_filename: str = "",
+        region: str = "",
+        addressing_style: str = "auto",
+        backend_name: str = "s3",
+    ):
+        self.endpoint = endpoint
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.bucket = bucket
+        self.secure = secure
+        self.public_base_url = public_base_url.rstrip("/")
+        self.custom_filename = custom_filename
+        self.region = region
+        self.addressing_style = addressing_style
+        self.name = backend_name
+
+    def upload(
+        self,
+        file_bytes: bytes,
+        counter: int,
+        model_name: str,
+        content_type: str = "application/octet-stream",
+        original_filename: str = "",
+    ) -> str:
+        try:
+            import boto3
+            from botocore.config import Config as BotoConfig
+        except ImportError as exc:
+            raise RuntimeError("Missing dependency: boto3. Please install it first.") from exc
+
+        endpoint_url = self.endpoint
+        if "://" not in endpoint_url:
+            scheme = "https" if self.secure else "http"
+            endpoint_url = f"{scheme}://{endpoint_url}"
+
+        session = boto3.session.Session()
+        s3_config = BotoConfig(
+            signature_version="s3v4",
+            s3={"addressing_style": self.addressing_style},
+        )
+        client = session.client(
+            "s3",
+            endpoint_url=endpoint_url,
+            aws_access_key_id=self.access_key,
+            aws_secret_access_key=self.secret_key,
+            region_name=self.region or None,
+            config=s3_config,
+        )
+
+        ext = _infer_extension(original_filename, content_type, fallback=".bin")
+        object_name = _build_object_name(self.custom_filename, counter, model_name, default_ext=ext)
+        client.put_object(
+            Bucket=self.bucket,
+            Key=object_name,
+            Body=file_bytes,
+            ContentType=content_type or "application/octet-stream",
+        )
+        quoted_name = urllib.parse.quote(object_name, safe="/")
+        return f"{self.public_base_url}/{quoted_name}"
+
+
+class COSStorageBackend(S3CompatibleStorageBackend):
+    name = "cos"
+
+    def __init__(
+        self,
+        endpoint: str,
+        access_key: str,
+        secret_key: str,
+        bucket: str,
+        secure: bool,
+        public_base_url: str,
+        custom_filename: str = "",
+        region: str = "",
+    ):
+        super().__init__(
+            endpoint=endpoint,
+            access_key=access_key,
+            secret_key=secret_key,
+            bucket=bucket,
+            secure=secure,
+            public_base_url=public_base_url,
+            custom_filename=custom_filename,
+            region=region,
+            addressing_style="virtual",
+            backend_name="cos",
+        )
+
+
 def load_storage_settings(
     config,
     cli_type=None,
@@ -276,13 +429,25 @@ def load_storage_settings(
     cli_secret_key=None,
     cli_channel=None,
     cli_custom_filename=None,
+    cli_provider=None,
+    cli_region=None,
     cli_secure=None,
 ):
-    storage_type_raw = _normalize_storage_type(_pick_first(
-        cli_type,
-        os.getenv("OBJECT_STORAGE_TYPE"),
-        _read_config(config, "object_storage_type"),
-    ))
+    storage_type_raw = _normalize_storage_type(
+        _pick_first(
+            cli_type,
+            os.getenv("OBJECT_STORAGE_TYPE"),
+            _read_config(config, "object_storage_type"),
+        )
+    )
+    provider = _normalize_provider(
+        _pick_first(
+            cli_provider,
+            os.getenv("OBJECT_STORAGE_PROVIDER"),
+            _read_config(config, "object_storage_provider"),
+            "auto",
+        )
+    )
 
     enabled_raw = cli_enabled
     if enabled_raw is None:
@@ -292,28 +457,53 @@ def load_storage_settings(
         )
     enabled_flag = parse_bool(enabled_raw, default=False)
     explicit_type = bool(storage_type_raw)
-    enabled = enabled_flag or explicit_type
+    explicit_provider = provider != "auto"
+    enabled = enabled_flag or explicit_type or explicit_provider
     custom_filename = _pick_first(
         cli_custom_filename,
         os.getenv("OBJECT_STORAGE_CUSTOM_FILENAME"),
         _read_config(config, "object_storage_custom_filename"),
     )
 
+    base_url_hint = _pick_first(
+        cli_base_url,
+        os.getenv("MINIO_ENDPOINT"),
+        os.getenv("COS_ENDPOINT"),
+        os.getenv("OBJECT_STORAGE_BASE_URL"),
+        _read_config(config, "object_storage_base_url"),
+        os.getenv("MODAL_OBJECT_STORAGE_BASE_URL"),
+    )
+    if storage_type_raw in {"", "auto"}:
+        if provider in {"local", "modal"}:
+            resolved_type = provider
+        elif provider in {"minio", "s3", "cos"} or _clean(base_url_hint):
+            resolved_type = "minio"
+        else:
+            resolved_type = "local"
+    else:
+        resolved_type = storage_type_raw
+
     if not enabled:
-        return StorageSettings(enabled=False, storage_type="none", custom_filename=custom_filename)
-    if not storage_type_raw:
-        raise RuntimeError(
-            "Object storage is enabled but type is missing. Pass --object-storage-type modal|minio|cos|local."
+        return StorageSettings(
+            enabled=False,
+            storage_type="none",
+            custom_filename=custom_filename,
+            provider=provider,
         )
-    if storage_type_raw not in VALID_STORAGE_TYPES:
+    if resolved_type not in VALID_STORAGE_TYPES:
         raise RuntimeError(
-            f"Unsupported object storage type '{storage_type_raw}'. Use one of: modal, minio, cos, local."
+            f"Unsupported object storage type '{resolved_type}'. Use one of: auto, modal, minio, cos, local."
         )
 
-    if storage_type_raw == "local":
-        return StorageSettings(enabled=True, storage_type="local", custom_filename=custom_filename)
+    if resolved_type == "local":
+        return StorageSettings(
+            enabled=True,
+            storage_type="local",
+            custom_filename=custom_filename,
+            provider="local",
+        )
 
-    if storage_type_raw == "modal":
+    if resolved_type == "modal":
         base_url = _pick_first(
             cli_base_url,
             os.getenv("MODAL_OBJECT_STORAGE_BASE_URL"),
@@ -348,6 +538,7 @@ def load_storage_settings(
             api_key=api_key,
             channel=channel,
             custom_filename=custom_filename,
+            provider="modal",
         )
 
     base_url = _pick_first(
@@ -373,24 +564,41 @@ def load_storage_settings(
     )
     if not secret_key:
         api_key, secret_key = _split_access_and_secret(api_key)
+
+    endpoint, endpoint_is_https, path_bucket_hint = _parse_object_storage_endpoint(base_url)
+    resolved_provider = _detect_object_storage_provider(
+        endpoint,
+        explicit_provider=provider,
+        storage_type_hint=resolved_type,
+    )
     channel = _pick_first(
         cli_channel,
         os.getenv("MINIO_BUCKET"),
         os.getenv("COS_BUCKET"),
         os.getenv("OBJECT_STORAGE_CHANNEL"),
         _read_config(config, "object_storage_channel", "default"),
+        path_bucket_hint,
         "default",
     )
-    endpoint, endpoint_is_https = _parse_minio_endpoint(base_url)
+    secure_default = endpoint_is_https or resolved_provider in {"cos", "s3"}
     secure = parse_bool(
         _pick_first(
             cli_secure,
             os.getenv("MINIO_SECURE"),
+            os.getenv("OBJECT_STORAGE_SECURE"),
             _read_config(config, "object_storage_secure"),
         ),
-        default=endpoint_is_https,
+        default=secure_default,
     )
-    public_base_url = _build_minio_public_base_url(
+    region = _pick_first(
+        cli_region,
+        os.getenv("OBJECT_STORAGE_REGION"),
+        os.getenv("MINIO_REGION"),
+        os.getenv("AWS_REGION"),
+        os.getenv("COS_REGION"),
+        _read_config(config, "object_storage_region"),
+    )
+    public_base_url = _build_object_storage_public_base_url(
         _pick_first(
             cli_public_base_url,
             os.getenv("MINIO_PUBLIC_BASE_URL"),
@@ -401,10 +609,11 @@ def load_storage_settings(
         endpoint=endpoint,
         secure=secure,
         bucket=channel,
+        provider=resolved_provider,
     )
     return StorageSettings(
         enabled=True,
-        storage_type=storage_type_raw,
+        storage_type="cos" if resolved_type == "cos" else "minio",
         base_url=endpoint,
         public_base_url=public_base_url,
         api_key=api_key,
@@ -412,6 +621,8 @@ def load_storage_settings(
         channel=channel,
         custom_filename=custom_filename,
         secure=secure,
+        provider=resolved_provider,
+        region=region,
     )
 
 
@@ -420,9 +631,10 @@ def create_storage_backend(settings: StorageSettings, output_dir: str, public_ba
         return None
 
     if settings.storage_type == "local":
-        if not _clean(public_base_url):
+        effective_public_base_url = _clean(public_base_url).rstrip("/")
+        if not effective_public_base_url:
             raise RuntimeError("Local storage requires a resolvable public base URL.")
-        return LocalStorageBackend(output_dir, public_base_url, settings.custom_filename)
+        return LocalStorageBackend(output_dir, effective_public_base_url, settings.custom_filename)
 
     if settings.storage_type == "modal":
         if not settings.base_url:
@@ -441,18 +653,47 @@ def create_storage_backend(settings: StorageSettings, output_dir: str, public_ba
             custom_filename=settings.custom_filename,
         )
 
-    if settings.storage_type in ("minio", "cos"):
-        provider = "COS" if settings.storage_type == "cos" else "MinIO"
+    if settings.storage_type in {"minio", "cos"}:
         if not settings.base_url:
-            raise RuntimeError(f"{provider} storage requires endpoint in object_storage_base_url.")
+            raise RuntimeError("Object storage requires endpoint in object_storage_base_url.")
         if not settings.api_key:
-            raise RuntimeError(f"{provider} storage requires access key in object_storage_api_key.")
+            raise RuntimeError("Object storage requires access key in object_storage_api_key.")
         if not settings.secret_key:
-            raise RuntimeError(f"{provider} storage requires secret key in object_storage_secret_key.")
+            raise RuntimeError("Object storage requires secret key in object_storage_secret_key.")
         if not settings.channel:
-            raise RuntimeError(f"{provider} storage requires bucket in object_storage_channel.")
+            raise RuntimeError("Object storage requires bucket in object_storage_channel.")
         if not settings.public_base_url:
-            raise RuntimeError(f"{provider} storage requires object_storage_public_base_url or resolvable endpoint.")
+            raise RuntimeError("Object storage requires object_storage_public_base_url or resolvable endpoint.")
+
+        provider = _detect_object_storage_provider(
+            settings.base_url,
+            explicit_provider=settings.provider,
+            storage_type_hint=settings.storage_type,
+        )
+        if provider == "cos":
+            return COSStorageBackend(
+                endpoint=settings.base_url,
+                access_key=settings.api_key,
+                secret_key=settings.secret_key,
+                bucket=settings.channel,
+                secure=settings.secure,
+                public_base_url=settings.public_base_url,
+                custom_filename=settings.custom_filename,
+                region=settings.region,
+            )
+        if provider == "s3":
+            return S3CompatibleStorageBackend(
+                endpoint=settings.base_url,
+                access_key=settings.api_key,
+                secret_key=settings.secret_key,
+                bucket=settings.channel,
+                secure=settings.secure,
+                public_base_url=settings.public_base_url,
+                custom_filename=settings.custom_filename,
+                region=settings.region,
+                addressing_style="virtual",
+                backend_name="s3",
+            )
         return MinioStorageBackend(
             endpoint=settings.base_url,
             access_key=settings.api_key,
@@ -461,7 +702,7 @@ def create_storage_backend(settings: StorageSettings, output_dir: str, public_ba
             secure=settings.secure,
             public_base_url=settings.public_base_url,
             custom_filename=settings.custom_filename,
-            backend_name=settings.storage_type,
+            backend_name=settings.storage_type or "minio",
         )
 
     return None
