@@ -159,11 +159,16 @@ def _build_object_name(custom_filename: str, counter: int, model_name: str, defa
     timestamp_ms = int(time.time() * 1000)
     custom_name = _clean(custom_filename)
     default_ext = default_ext if default_ext.startswith(".") else f".{default_ext}"
+    default_ext = default_ext.lower()
     if custom_name:
         custom_name = os.path.basename(custom_name)
         base, ext = os.path.splitext(custom_name)
         safe_base = re.sub(r"[^a-zA-Z0-9_.-]", "_", base) or "file"
-        return f"{safe_base}_{timestamp_ms}_{counter}{ext or default_ext}"
+        normalized_ext = ext.lower()
+        # Keep custom basename, but force the extension to match actual media type.
+        if not normalized_ext or normalized_ext != default_ext:
+            normalized_ext = default_ext
+        return f"{safe_base}_{timestamp_ms}_{counter}{normalized_ext}"
     safe_model_name = re.sub(r"[^a-zA-Z0-9_.-]", "_", model_name) or "workflow"
     return f"{safe_model_name}_{timestamp_ms}_{counter}{default_ext}"
 
