@@ -453,34 +453,6 @@ def build_local_filename(counter: int, filename_hint: str, content_type: str, me
     return f"{timestamp}_{counter}{ext}"
 
 
-def ensure_bucket_in_cos_url(url: str, bucket: str):
-    candidate = str(url or "").strip()
-    bucket_clean = str(bucket or "").strip()
-    if not candidate or not bucket_clean:
-        return candidate
-
-    parsed = urllib.parse.urlparse(candidate)
-    host = (parsed.netloc or "").strip()
-    if not host:
-        return candidate
-
-    host_lower = host.lower()
-    bucket_lower = bucket_clean.lower()
-    if not host_lower.endswith(".myqcloud.com"):
-        return candidate
-    if host_lower.startswith(f"{bucket_lower}."):
-        return candidate
-
-    path_segments = [segment for segment in (parsed.path or "").split("/") if segment]
-    if path_segments and path_segments[0].lower() == bucket_lower:
-        return candidate
-
-    new_netloc = f"{bucket_clean}.{host}"
-    return urllib.parse.urlunparse(
-        (parsed.scheme, new_netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
-    )
-
-
 def queue_prompt(prompt):
     p = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(p).encode("utf-8")
@@ -1245,7 +1217,13 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                 public_base_url=public_base_url,
             )
         except Exception as backend_err:
-            print(f"Storage backend init failed, fallback to local/imgbb: {backend_err}")
+            error_msg = f"Storage backend init failed: {backend_err}"
+            print(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg) from backend_err
+        if storage_settings is not None and storage_settings.enabled and storage_backend is None:
+            error_msg = "Storage backend init failed: enabled=true but backend is not available."
+            print(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
 
         counter = 0
         def save_media(file_bytes: bytes, filename_hint: str, content_type: str, media_kind: str):
@@ -1264,10 +1242,6 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                         content_type=safe_content_type,
                         original_filename=safe_filename_hint,
                     )
-                    media_url = ensure_bucket_in_cos_url(
-                        media_url,
-                        getattr(storage_settings, "channel", ""),
-                    )
                     parsed_name = os.path.basename(urllib.parse.urlparse(media_url).path)
                     uploaded_name = urllib.parse.unquote(parsed_name) or safe_filename_hint
                     media_entries.append(
@@ -1280,7 +1254,9 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                     )
                     return
                 except Exception as upload_err:
-                    print(f"{storage_backend.name} upload failed, fallback to local/imgbb: {upload_err}")
+                    error_msg = f"{storage_backend.name} upload failed: {upload_err}"
+                    print(error_msg)
+                    raise HTTPException(status_code=500, detail=error_msg) from upload_err
 
             is_image = normalized_kind == "image" or safe_content_type.startswith("image/")
             if is_image and imgbb_key:

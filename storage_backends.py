@@ -127,7 +127,7 @@ def _is_probable_vendor_endpoint(host: str, provider: str):
     return False
 
 
-def _ensure_bucket_in_public_base_url(
+def _validate_bucket_in_public_base_url(
     public_base_url: str,
     endpoint: str,
     secure: bool,
@@ -138,32 +138,32 @@ def _ensure_bucket_in_public_base_url(
     normalized_bucket = _clean(bucket)
     normalized_provider = _normalize_provider(provider)
     if not normalized_base or not normalized_bucket or normalized_provider not in {"cos", "s3"}:
-        return normalized_base
+        return
 
     default_scheme = "https" if secure else "http"
     parse_target = normalized_base if "://" in normalized_base else f"{default_scheme}://{normalized_base.lstrip('/')}"
     parsed = urllib.parse.urlparse(parse_target)
     host = (parsed.netloc or "").strip()
     if not host:
-        return normalized_base
+        return
 
     bucket_lower = normalized_bucket.lower()
     if host.lower().startswith(f"{bucket_lower}."):
-        return normalized_base
+        return
 
     path_segments = [segment for segment in parsed.path.split("/") if segment]
     if path_segments and path_segments[0].lower() == bucket_lower:
-        return normalized_base
+        return
 
     endpoint_host, _, _ = _parse_object_storage_endpoint(endpoint)
     host_is_endpoint = bool(endpoint_host) and host.lower() == endpoint_host.lower()
     if not host_is_endpoint and not _is_probable_vendor_endpoint(host, normalized_provider):
-        return normalized_base
+        return
 
-    rebuilt = urllib.parse.urlunparse(
-        (parsed.scheme or default_scheme, f"{normalized_bucket}.{host}", "", "", "", "")
+    raise RuntimeError(
+        f"Invalid object_storage_public_base_url '{normalized_base}': missing bucket '{normalized_bucket}'. "
+        f"Expected host '{normalized_bucket}.{host}' or path '/{normalized_bucket}/...'."
     )
-    return rebuilt.rstrip("/")
 
 
 def _build_object_storage_public_base_url(
@@ -176,13 +176,14 @@ def _build_object_storage_public_base_url(
     base_url = _clean(public_base_url).rstrip("/")
     provider = _normalize_provider(provider)
     if base_url:
-        return _ensure_bucket_in_public_base_url(
+        _validate_bucket_in_public_base_url(
             public_base_url=base_url,
             endpoint=endpoint,
             secure=secure,
             bucket=bucket,
             provider=provider,
         )
+        return base_url
     if not endpoint:
         return ""
 
