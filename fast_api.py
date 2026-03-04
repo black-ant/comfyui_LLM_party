@@ -453,6 +453,34 @@ def build_local_filename(counter: int, filename_hint: str, content_type: str, me
     return f"{timestamp}_{counter}{ext}"
 
 
+def ensure_bucket_in_cos_url(url: str, bucket: str):
+    candidate = str(url or "").strip()
+    bucket_clean = str(bucket or "").strip()
+    if not candidate or not bucket_clean:
+        return candidate
+
+    parsed = urllib.parse.urlparse(candidate)
+    host = (parsed.netloc or "").strip()
+    if not host:
+        return candidate
+
+    host_lower = host.lower()
+    bucket_lower = bucket_clean.lower()
+    if not host_lower.endswith(".myqcloud.com"):
+        return candidate
+    if host_lower.startswith(f"{bucket_lower}."):
+        return candidate
+
+    path_segments = [segment for segment in (parsed.path or "").split("/") if segment]
+    if path_segments and path_segments[0].lower() == bucket_lower:
+        return candidate
+
+    new_netloc = f"{bucket_clean}.{host}"
+    return urllib.parse.urlunparse(
+        (parsed.scheme, new_netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+    )
+
+
 def queue_prompt(prompt):
     p = {"prompt": prompt, "client_id": client_id}
     data = json.dumps(p).encode("utf-8")
@@ -1202,6 +1230,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         output_dir = os.path.join(current_dir_path, "output")
         os.makedirs(output_dir, exist_ok=True)
         storage_backend = None
+        storage_settings = None
         storage_profile_id = ""
         try:
             storage_settings, storage_profile_id = resolve_storage_settings(
@@ -1234,6 +1263,10 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
                         model_name=model_name,
                         content_type=safe_content_type,
                         original_filename=safe_filename_hint,
+                    )
+                    media_url = ensure_bucket_in_cos_url(
+                        media_url,
+                        getattr(storage_settings, "channel", ""),
                     )
                     parsed_name = os.path.basename(urllib.parse.urlparse(media_url).path)
                     uploaded_name = urllib.parse.unquote(parsed_name) or safe_filename_hint
