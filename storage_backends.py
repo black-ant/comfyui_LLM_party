@@ -160,9 +160,11 @@ def _validate_bucket_in_public_base_url(
     if not host_is_endpoint and not _is_probable_vendor_endpoint(host, normalized_provider):
         return
 
-    raise RuntimeError(
-        f"Invalid object_storage_public_base_url '{normalized_base}': missing bucket '{normalized_bucket}'. "
-        f"Expected host '{normalized_bucket}.{host}' or path '/{normalized_bucket}/...'."
+    print(
+        "[storage_backends][warn] "
+        f"object_storage_public_base_url '{normalized_base}' does not include bucket '{normalized_bucket}'. "
+        f"Expected host '{normalized_bucket}.{host}' or path '/{normalized_bucket}/...'. "
+        "Continue with provided URL (weak validation mode)."
     )
 
 
@@ -494,16 +496,22 @@ def load_storage_settings(
     cli_provider=None,
     cli_region=None,
     cli_secure=None,
+    cli_only=False,
 ):
+    def pick_storage_value(cli_value, *fallbacks):
+        if cli_only:
+            return _clean(cli_value)
+        return _pick_first(cli_value, *fallbacks)
+
     storage_type_raw = _normalize_storage_type(
-        _pick_first(
+        pick_storage_value(
             cli_type,
             os.getenv("OBJECT_STORAGE_TYPE"),
             _read_config(config, "object_storage_type"),
         )
     )
     provider = _normalize_provider(
-        _pick_first(
+        pick_storage_value(
             cli_provider,
             os.getenv("OBJECT_STORAGE_PROVIDER"),
             _read_config(config, "object_storage_provider"),
@@ -512,7 +520,7 @@ def load_storage_settings(
     )
 
     enabled_raw = cli_enabled
-    if enabled_raw is None:
+    if enabled_raw is None and not cli_only:
         enabled_raw = _pick_first(
             os.getenv("OBJECT_STORAGE_ENABLED"),
             _read_config(config, "object_storage_enabled"),
@@ -521,13 +529,13 @@ def load_storage_settings(
     explicit_type = bool(storage_type_raw)
     explicit_provider = provider != "auto"
     enabled = enabled_flag or explicit_type or explicit_provider
-    custom_filename = _pick_first(
+    custom_filename = pick_storage_value(
         cli_custom_filename,
         os.getenv("OBJECT_STORAGE_CUSTOM_FILENAME"),
         _read_config(config, "object_storage_custom_filename"),
     )
 
-    base_url_hint = _pick_first(
+    base_url_hint = pick_storage_value(
         cli_base_url,
         os.getenv("MINIO_ENDPOINT"),
         os.getenv("COS_ENDPOINT"),
@@ -566,32 +574,36 @@ def load_storage_settings(
         )
 
     if resolved_type == "modal":
-        base_url = _pick_first(
+        base_url = pick_storage_value(
             cli_base_url,
             os.getenv("MODAL_OBJECT_STORAGE_BASE_URL"),
             os.getenv("OBJECT_STORAGE_BASE_URL"),
             _read_config(config, "object_storage_base_url"),
         )
-        api_key = _pick_first(
+        api_key = pick_storage_value(
             cli_api_key,
             os.getenv("MODAL_OBJECT_STORAGE_API_KEY"),
             os.getenv("OBJECT_STORAGE_API_KEY"),
             _read_config(config, "object_storage_api_key"),
         )
-        channel = _pick_first(
+        channel = pick_storage_value(
             cli_channel,
             os.getenv("MODAL_OBJECT_STORAGE_CHANNEL"),
             os.getenv("OBJECT_STORAGE_CHANNEL"),
             _read_config(config, "object_storage_channel", "default"),
             "default",
         )
-        public_base_url = _pick_first(
+        if not channel:
+            channel = "default"
+        public_base_url = pick_storage_value(
             cli_public_base_url,
             os.getenv("MODAL_OBJECT_STORAGE_PUBLIC_BASE_URL"),
             os.getenv("OBJECT_STORAGE_PUBLIC_BASE_URL"),
             _read_config(config, "object_storage_public_base_url"),
             base_url,
         )
+        if not public_base_url and cli_only:
+            public_base_url = base_url
         return StorageSettings(
             enabled=True,
             storage_type="modal",
@@ -603,21 +615,21 @@ def load_storage_settings(
             provider="modal",
         )
 
-    base_url = _pick_first(
+    base_url = pick_storage_value(
         cli_base_url,
         os.getenv("MINIO_ENDPOINT"),
         os.getenv("COS_ENDPOINT"),
         os.getenv("OBJECT_STORAGE_BASE_URL"),
         _read_config(config, "object_storage_base_url"),
     )
-    api_key = _pick_first(
+    api_key = pick_storage_value(
         cli_api_key,
         os.getenv("MINIO_ACCESS_KEY"),
         os.getenv("COS_SECRET_ID"),
         os.getenv("OBJECT_STORAGE_API_KEY"),
         _read_config(config, "object_storage_api_key"),
     )
-    secret_key = _pick_first(
+    secret_key = pick_storage_value(
         cli_secret_key,
         os.getenv("MINIO_SECRET_KEY"),
         os.getenv("COS_SECRET_KEY"),
@@ -633,7 +645,7 @@ def load_storage_settings(
         explicit_provider=provider,
         storage_type_hint=resolved_type,
     )
-    channel = _pick_first(
+    channel = pick_storage_value(
         cli_channel,
         os.getenv("MINIO_BUCKET"),
         os.getenv("COS_BUCKET"),
@@ -642,9 +654,11 @@ def load_storage_settings(
         path_bucket_hint,
         "default",
     )
+    if not channel:
+        channel = path_bucket_hint or "default"
     secure_default = endpoint_is_https or resolved_provider in {"cos", "s3"}
     secure = parse_bool(
-        _pick_first(
+        pick_storage_value(
             cli_secure,
             os.getenv("MINIO_SECURE"),
             os.getenv("OBJECT_STORAGE_SECURE"),
@@ -652,7 +666,7 @@ def load_storage_settings(
         ),
         default=secure_default,
     )
-    region = _pick_first(
+    region = pick_storage_value(
         cli_region,
         os.getenv("OBJECT_STORAGE_REGION"),
         os.getenv("MINIO_REGION"),
@@ -661,7 +675,7 @@ def load_storage_settings(
         _read_config(config, "object_storage_region"),
     )
     public_base_url = _build_object_storage_public_base_url(
-        _pick_first(
+        pick_storage_value(
             cli_public_base_url,
             os.getenv("MINIO_PUBLIC_BASE_URL"),
             os.getenv("COS_PUBLIC_BASE_URL"),

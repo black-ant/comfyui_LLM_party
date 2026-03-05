@@ -61,20 +61,12 @@ config.read(os.path.join(current_dir_path, "config.ini"))
 if parse_bool(args.object_storage_enabled, default=False):
     configured_type = (
         (args.object_storage_type or "").strip()
-        or os.getenv("OBJECT_STORAGE_TYPE", "").strip()
-        or config.get("API_KEYS", "object_storage_type", fallback="").strip()
     )
     configured_provider = (
         (args.object_storage_provider or "").strip()
-        or os.getenv("OBJECT_STORAGE_PROVIDER", "").strip()
-        or config.get("API_KEYS", "object_storage_provider", fallback="").strip()
     )
     configured_base_url = (
         (args.object_storage_base_url or "").strip()
-        or os.getenv("OBJECT_STORAGE_BASE_URL", "").strip()
-        or os.getenv("MINIO_ENDPOINT", "").strip()
-        or os.getenv("MODAL_OBJECT_STORAGE_BASE_URL", "").strip()
-        or config.get("API_KEYS", "object_storage_base_url", fallback="").strip()
     )
     if not configured_type and not configured_provider and not configured_base_url:
         parser.error(
@@ -333,27 +325,22 @@ def resolve_storage_settings(
     request: Optional[Request],
     request_id: str = "",
 ):
-    profile_id, profile_overrides = resolve_storage_profile(
-        request_data=request_data,
-        request=request,
-        runtime_config=runtime_config,
-        request_id=request_id,
-    )
-
     storage_settings = load_storage_settings(
         runtime_config,
-        cli_type=profile_overrides.get("type", args.object_storage_type),
-        cli_enabled=profile_overrides.get("enabled", args.object_storage_enabled),
-        cli_provider=profile_overrides.get("provider", args.object_storage_provider),
-        cli_region=profile_overrides.get("region", args.object_storage_region),
-        cli_base_url=profile_overrides.get("base_url", args.object_storage_base_url),
-        cli_public_base_url=profile_overrides.get("public_base_url", args.object_storage_public_base_url),
-        cli_api_key=profile_overrides.get("api_key", args.object_storage_api_key),
-        cli_secret_key=profile_overrides.get("secret_key", args.object_storage_secret_key),
-        cli_channel=profile_overrides.get("channel", args.object_storage_channel),
-        cli_custom_filename=profile_overrides.get("custom_filename", args.object_storage_custom_filename),
-        cli_secure=profile_overrides.get("secure"),
+        cli_type=args.object_storage_type,
+        cli_enabled=args.object_storage_enabled,
+        cli_provider=args.object_storage_provider,
+        cli_region=args.object_storage_region,
+        cli_base_url=args.object_storage_base_url,
+        cli_public_base_url=args.object_storage_public_base_url,
+        cli_api_key=args.object_storage_api_key,
+        cli_secret_key=args.object_storage_secret_key,
+        cli_channel=args.object_storage_channel,
+        cli_custom_filename=args.object_storage_custom_filename,
+        cli_secure=None,
+        cli_only=True,
     )
+    profile_id = ""
 
     _log_request(
         "storage_settings_resolved",
