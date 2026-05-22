@@ -4,12 +4,33 @@
 
 ## Shared Local Skills
 
+<<<<<<< HEAD
 Use the shared local skill below when the task matches its scope:
 
 - `page-style-linear-flow`: `D:\code\open_source\ant-ready-start\skills\page-style-linear-flow\SKILL.md`
 
 Apply it for frontend page design or refactors involving pages, admin panels, forms, tables, dashboards, detail views, wizards, modal/drawer placement, or multi-step flows.
 
+=======
+Use the shared local skills below when the task matches their scope:
+
+- `page-style-linear-flow`: `D:\code\open_source\ant-ready-start\skills\page-style-linear-flow\SKILL.md`
+- `ui-ux-pro-max`: `D:\code\open_source\ant-ready-start\skills\ui-ux-pro-max\SKILL.md`
+- `frontend-skill`: `D:\code\open_source\ant-ready-start\skills\frontend-skill\SKILL.md`
+- `create-plan`: `D:\code\open_source\ant-ready-start\skills\create-plan\SKILL.md`
+- `create-plan-doc`: `D:\code\open_source\ant-ready-start\skills\create-plan-doc\SKILL.md`
+
+Apply it for frontend page design or refactors involving pages, admin panels, forms, tables, dashboards, detail views, wizards, modal/drawer placement, or multi-step flows.
+
+Apply `ui-ux-pro-max` for broader UI/UX design work involving visual direction, design-system shaping, palette and typography selection, component styling, landing pages, dashboards, and cross-stack interface generation when linear-flow rules alone are not enough.
+
+Apply `frontend-skill` when the task needs stronger frontend art direction, visual hierarchy, landing-page composition, sparse premium layouts, image-led sections, or restrained motion design.
+
+Apply `create-plan` when the user explicitly asks for a plan, task breakdown, implementation roadmap, rollout outline, or a step-by-step execution plan before coding.
+
+Apply `create-plan-doc` when the user explicitly asks for a plan that should also be saved into the repository as a markdown document under `docs/plan`.
+
+>>>>>>> c0c447ee9f351c1e58e9451352ee2f9741f01658
 Core expectations:
 
 - Keep each page focused on one primary responsibility.
