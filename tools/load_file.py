@@ -322,12 +322,12 @@ class start_workflow:
                 file_out = read_one(file_path)
                 print(file_out)
         file_out = json.dumps(file_out, ensure_ascii=False, indent=4)
-        img_out = []
-        if image_input1 is not None:
-            img_out=image_input1
-        img_out2 = []
-        if image_input2 is not None:
-            img_out2=image_input2
+        img_out = None
+        if isinstance(image_input1, torch.Tensor):
+            img_out = image_input1
+        img_out2 = None
+        if isinstance(image_input2, torch.Tensor):
+            img_out2 = image_input2
         if img_path1 is not None and img_path1 != "":
             img_out = []
             # 检查img_path是否是一个目录
@@ -360,6 +360,8 @@ class start_workflow:
                 img_out = torch.cat(img_out, dim=0)
             elif img_out:
                 img_out = img_out[0]
+            else:
+                img_out = None
 
         if img_path2 is not None and img_path2 != "":
             img_out2 = []
@@ -377,7 +379,7 @@ class start_workflow:
                         image = img.convert("RGB")
                         image = np.array(image).astype(np.float32) / 255.0
                         image = torch.from_numpy(image).unsqueeze(0)
-                        img_out.append(image)
+                        img_out2.append(image)
             else:
                 img = Image.open(img_path2)
                 for i in ImageSequence.Iterator(img):
@@ -393,6 +395,8 @@ class start_workflow:
                 img_out2 = torch.cat(img_out2, dim=0)
             elif img_out2:
                 img_out2 = img_out2[0]
+            else:
+                img_out2 = None
 
         system_out = system_prompt
         user_out = user_prompt
