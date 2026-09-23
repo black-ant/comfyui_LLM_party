@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from io import BytesIO
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -90,6 +90,7 @@ def _get_stream_heartbeat_seconds():
 
 
 STREAM_HEARTBEAT_SECONDS = _get_stream_heartbeat_seconds()
+ProgressCallback = Optional[Callable[[Dict[str, Any]], None]]
 VIDEO_FILE_EXTENSIONS = {
     ".mp4",
     ".mov",
@@ -440,8 +441,8 @@ def build_local_filename(counter: int, filename_hint: str, content_type: str, me
     return f"{timestamp}_{counter}{ext}"
 
 
-def queue_prompt(prompt):
-    p = {"prompt": prompt, "client_id": client_id}
+def queue_prompt(prompt, workflow_client_id: Optional[str] = None):
+    p = {"prompt": prompt, "client_id": workflow_client_id or client_id}
     data = json.dumps(p).encode("utf-8")
     req = urllib.request.Request("http://{}/prompt".format(server_address), data=data)
     return json.loads(urllib.request.urlopen(req).read())
@@ -463,19 +464,240 @@ def get_history(prompt_id):
         return json.loads(response.read())
 
 
-def get_all(prompt, request_id: str = ""):
-    prompt_id = queue_prompt(prompt)["prompt_id"]
+def _emit_comfyui_progress(
+    state: Dict[str, Any],
+    prompt_id: str,
+    callback: ProgressCallback,
+    *,
+    phase: str,
+    value: Optional[float] = None,
+    maximum: Optional[float] = None,
+    node: Optional[str] = None,
+    queue_remaining: Optional[int] = None,
+    force: bool = False,
+):
+    if callback is None:
+        return
+
+    if value is not None:
+        try:
+            state["value"] = max(0.0, float(value))
+        except (TypeError, ValueError):
+            pass
+    if maximum is not None:
+        try:
+            parsed_maximum = float(maximum)
+            if parsed_maximum > 0:
+                state["max"] = parsed_maximum
+        except (TypeError, ValueError):
+            pass
+    if node is not None:
+        state["node"] = str(node)
+
+    total_nodes = max(int(state.get("total_nodes", 1)), 1)
+    completed_nodes = state["completed_nodes"]
+    current_max = max(float(state.get("max", 1.0)), 1.0)
+    current_value = min(max(float(state.get("value", 0.0)), 0.0), current_max)
+    current_fraction = current_value / current_max
+    if phase == "queued":
+        percent = 0
+    elif phase == "completed":
+        percent = 100
+    else:
+        percent = round(((len(completed_nodes) + current_fraction) / total_nodes) * 100)
+        percent = max(0, min(99, percent))
+
+    if not force and percent == state.get("last_percent"):
+        return
+    state["last_percent"] = percent
+
+    payload = {
+        "percent": percent,
+        "value": state.get("value", 0.0),
+        "max": state.get("max", 1.0),
+        "prompt_id": prompt_id,
+        "node": state.get("node"),
+        "phase": phase,
+        "completed_nodes": len(completed_nodes),
+        "total_nodes": total_nodes,
+    }
+    if queue_remaining is not None:
+        payload["queue_remaining"] = queue_remaining
+    callback(payload)
+
+
+def _consume_comfyui_progress_message(
+    raw_message: Any,
+    prompt_id: str,
+    state: Dict[str, Any],
+    callback: ProgressCallback,
+):
+    if not isinstance(raw_message, str) or not raw_message:
+        return
+    try:
+        message = json.loads(raw_message)
+    except (TypeError, ValueError):
+        return
+
+    event_type = message.get("type")
+    data = message.get("data")
+    if not isinstance(data, dict):
+        return
+    event_prompt_id = data.get("prompt_id")
+    if event_prompt_id and event_prompt_id != prompt_id:
+        return
+
+    if event_type == "status":
+        status = data.get("status") if isinstance(data.get("status"), dict) else {}
+        exec_info = status.get("exec_info") if isinstance(status.get("exec_info"), dict) else {}
+        queue_remaining = exec_info.get("queue_remaining")
+        if isinstance(queue_remaining, (int, float)):
+            _emit_comfyui_progress(
+                state,
+                prompt_id,
+                callback,
+                phase="queued",
+                queue_remaining=int(queue_remaining),
+                force=True,
+            )
+        return
+
+    if event_type == "execution_start":
+        _emit_comfyui_progress(state, prompt_id, callback, phase="starting", force=True)
+        return
+
+    if event_type == "execution_cached":
+        cached_nodes = data.get("nodes")
+        if isinstance(cached_nodes, list):
+            state["completed_nodes"].update(str(node_id) for node_id in cached_nodes)
+        _emit_comfyui_progress(state, prompt_id, callback, phase="running", force=True)
+        return
+
+    if event_type == "progress":
+        _emit_comfyui_progress(
+            state,
+            prompt_id,
+            callback,
+            phase="sampling",
+            value=data.get("value"),
+            maximum=data.get("max"),
+            node=data.get("node"),
+        )
+        return
+
+    if event_type == "progress_state":
+        nodes = data.get("nodes")
+        if isinstance(nodes, dict):
+            for node_id, node_state in nodes.items():
+                if not isinstance(node_state, dict):
+                    continue
+                state_name = str(node_state.get("state", ""))
+                value = node_state.get("value", 0)
+                maximum = node_state.get("max", 1)
+                if state_name == "finished" or (
+                    isinstance(value, (int, float))
+                    and isinstance(maximum, (int, float))
+                    and maximum > 0
+                    and value >= maximum
+                ):
+                    state["completed_nodes"].add(str(node_id))
+                elif state_name == "running":
+                    state["node"] = str(node_id)
+                    state["value"] = value
+                    state["max"] = maximum
+        _emit_comfyui_progress(state, prompt_id, callback, phase="running")
+        return
+
+    if event_type == "executed":
+        node_id = data.get("node")
+        if node_id is not None:
+            state["completed_nodes"].add(str(node_id))
+        _emit_comfyui_progress(state, prompt_id, callback, phase="running", force=True)
+        return
+
+    if event_type == "executing":
+        node_id = data.get("node")
+        if node_id is None:
+            _emit_comfyui_progress(state, prompt_id, callback, phase="finishing", force=True)
+        else:
+            state["node"] = str(node_id)
+            state["value"] = 0.0
+            state["max"] = 1.0
+            _emit_comfyui_progress(state, prompt_id, callback, phase="node", force=True)
+
+
+def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = None):
+    workflow_client_id = str(uuid.uuid4())
+    progress_socket = None
+    try:
+        progress_socket = websocket.create_connection(
+            "ws://{}/ws?clientId={}".format(server_address, workflow_client_id),
+            timeout=5,
+        )
+        progress_socket.settimeout(0.2)
+    except Exception as ws_error:
+        _log_request("progress_socket_error", request_id, {"error": str(ws_error)})
+        progress_socket = None
+
+    try:
+        prompt_id = queue_prompt(prompt, workflow_client_id)["prompt_id"]
+    except Exception:
+        if progress_socket is not None:
+            progress_socket.close()
+        raise
+
+    progress_state = {
+        "completed_nodes": set(),
+        "total_nodes": max(len(prompt), 1) if isinstance(prompt, dict) else 1,
+        "value": 0.0,
+        "max": 1.0,
+        "node": None,
+        "last_percent": None,
+    }
+    _emit_comfyui_progress(progress_state, prompt_id, progress_callback, phase="queued", force=True)
     output_images = {}
     output_media = {}
     output_text = ""
 
-    while True:
-        try:
-            history = get_history(prompt_id)[prompt_id]
-            break
-        except Exception:
-            time.sleep(0.1)
-            continue
+    try:
+        while True:
+            if progress_socket is not None:
+                try:
+                    while True:
+                        raw_message = progress_socket.recv()
+                        if not raw_message:
+                            progress_socket.close()
+                            progress_socket = None
+                            break
+                        _consume_comfyui_progress_message(
+                            raw_message,
+                            prompt_id,
+                            progress_state,
+                            progress_callback,
+                        )
+                except websocket.WebSocketTimeoutException:
+                    pass
+                except Exception as ws_error:
+                    _log_request("progress_socket_closed", request_id, {"error": str(ws_error)})
+                    progress_socket.close()
+                    progress_socket = None
+
+            try:
+                history = get_history(prompt_id)[prompt_id]
+                _emit_comfyui_progress(
+                    progress_state,
+                    prompt_id,
+                    progress_callback,
+                    phase="completed",
+                    force=True,
+                )
+                break
+            except Exception:
+                time.sleep(0.1)
+                continue
+    finally:
+        if progress_socket is not None:
+            progress_socket.close()
 
     for node_id, node_output in history.get("outputs", {}).items():
         if not isinstance(node_output, dict):
@@ -639,6 +861,7 @@ def api(
     user_history="",
     request_id="",
     img_path2="",
+    progress_callback: ProgressCallback = None,
 ):
     global current_dir_path
     workflow_path = workflow_path
@@ -731,7 +954,11 @@ def api(
                 },
             )
 
-    images, media, res = get_all(prompt, request_id=request_id)
+    images, media, res = get_all(
+        prompt,
+        request_id=request_id,
+        progress_callback=progress_callback,
+    )
     _log_request(
         "api_output",
         request_id,
@@ -870,7 +1097,12 @@ async def stream_response(response_text: str, model_name: str):
     yield "data: [DONE]\n\n"
 
 
-def _build_stream_sse_frame(model_name: str, delta: Optional[Dict[str, Any]] = None, finish_reason: Optional[str] = None):
+def _build_stream_sse_frame(
+    model_name: str,
+    delta: Optional[Dict[str, Any]] = None,
+    finish_reason: Optional[str] = None,
+    progress: Optional[Dict[str, Any]] = None,
+):
     payload = {
         "id": "chatcmpl-" + str(uuid.uuid4()),
         "object": "chat.completion.chunk",
@@ -884,6 +1116,8 @@ def _build_stream_sse_frame(model_name: str, delta: Optional[Dict[str, Any]] = N
             }
         ],
     }
+    if progress is not None:
+        payload["progress"] = progress
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
 @app.post("/v1/chat/completions")
@@ -937,39 +1171,79 @@ def _extract_content_from_completion(response):
 
 
 async def stream_completion_with_heartbeat(request_data: CompletionRequest, request: Request, request_id: str):
-    task = asyncio.create_task(process_request(request_data, request, request_id=request_id))
+    progress_queue = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    def on_progress(progress: Dict[str, Any]):
+        loop.call_soon_threadsafe(progress_queue.put_nowait, progress)
+
+    task = asyncio.create_task(
+        process_request(
+            request_data,
+            request,
+            request_id=request_id,
+            progress_callback=on_progress,
+        )
+    )
+    progress_waiter = asyncio.create_task(progress_queue.get())
     # Send an immediate empty chunk so intermediaries receive bytes quickly.
     yield _build_stream_sse_frame(model_name=request_data.model, delta={})
-    while True:
-        try:
-            response = await asyncio.wait_for(asyncio.shield(task), timeout=STREAM_HEARTBEAT_SECONDS)
-            break
-        except asyncio.TimeoutError:
-            if await request.is_disconnected():
-                task.cancel()
-                return
-            # Keep both comment-frame and data-frame heartbeats for proxy compatibility.
-            yield ": keep-alive\n\n"
-            yield _build_stream_sse_frame(model_name=request_data.model, delta={})
-        except Exception as exc:
-            _log_request("stream_error", request_id, {"error": str(exc)})
-            error_payload = {
-                "id": "chatcmpl-" + str(uuid.uuid4()),
-                "object": "error",
-                "created": int(time.time()),
-                "model": request_data.model,
-                "error": {"message": str(exc)},
-            }
-            yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
-            yield "data: [DONE]\n\n"
-            return
+
+    try:
+        while True:
+            done, _ = await asyncio.wait(
+                {task, progress_waiter},
+                timeout=STREAM_HEARTBEAT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if progress_waiter in done:
+                progress = progress_waiter.result()
+                yield _build_stream_sse_frame(
+                    model_name=request_data.model,
+                    delta={},
+                    progress=progress,
+                )
+                progress_waiter = asyncio.create_task(progress_queue.get())
+
+            if task in done:
+                try:
+                    response = task.result()
+                except Exception as exc:
+                    _log_request("stream_error", request_id, {"error": str(exc)})
+                    error_payload = {
+                        "id": "chatcmpl-" + str(uuid.uuid4()),
+                        "object": "error",
+                        "created": int(time.time()),
+                        "model": request_data.model,
+                        "error": {"message": str(exc)},
+                    }
+                    yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+                break
+
+            if not done:
+                if await request.is_disconnected():
+                    task.cancel()
+                    return
+                # Keep both comment-frame and data-frame heartbeats for proxy compatibility.
+                yield ": keep-alive\n\n"
+                yield _build_stream_sse_frame(model_name=request_data.model, delta={})
+    finally:
+        if not progress_waiter.done():
+            progress_waiter.cancel()
 
     _log_request("completion_response", request_id, response)
     content = _extract_content_from_completion(response)
     async for chunk in stream_response(content, request_data.model):
         yield chunk
 
-async def process_request(request_data: CompletionRequest, request: Optional[Request] = None, request_id: str = ""):
+async def process_request(
+    request_data: CompletionRequest,
+    request: Optional[Request] = None,
+    request_id: str = "",
+    progress_callback: ProgressCallback = None,
+):
     model_name = (request_data.model or "").strip()
     if not model_name:
         raise HTTPException(status_code=400, detail="model is required")
@@ -1137,6 +1411,7 @@ async def process_request(request_data: CompletionRequest, request: Optional[Req
         workflow_path=workflow_path,
         user_history=user_histories,
         request_id=request_id,
+        progress_callback=progress_callback,
     )
 
     has_images = isinstance(images, dict) and any(images.values())
