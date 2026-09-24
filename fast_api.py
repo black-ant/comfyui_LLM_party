@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 from storage_backends import create_storage_backend, load_storage_settings, parse_bool
+from workflow_parameters import apply_workflow_parameters, normalize_workflow_parameters
 import asyncio
 parser = argparse.ArgumentParser(description="Run the server with specified host and port.")
 parser.add_argument("--host", type=str, default="127.0.0.1", help="Host address to bind the server.")
@@ -862,6 +863,7 @@ def api(
     request_id="",
     img_path2="",
     progress_callback: ProgressCallback = None,
+    workflow_params=None,
 ):
     global current_dir_path
     workflow_path = workflow_path
@@ -903,6 +905,16 @@ def api(
         prompt = json.loads(prompt_text)
     except json.JSONDecodeError as e:
         raise HTTPException(status_code=400, detail=f"Invalid workflow JSON: {e.msg}") from e
+
+    workflow_config = {}
+    if isinstance(prompt, dict):
+        raw_workflow_config = prompt.pop("__llm_party__", None)
+        if isinstance(raw_workflow_config, dict):
+            workflow_config = raw_workflow_config
+
+    parameter_report = apply_workflow_parameters(prompt, workflow_params, workflow_config)
+    if parameter_report["requested"]:
+        _log_request("workflow_parameters_applied", request_id, parameter_report)
 
     validate_api_workflow(prompt, workflow_path)
 
@@ -1014,6 +1026,26 @@ class CompletionRequest(BaseModel):
     max_tokens: int = 150
     stream: bool = False
     storage_profile: Optional[str] = None
+    duration: Optional[int] = None
+    resolution: Optional[str] = None
+    fps: Optional[int] = None
+    aspect_ratio: Optional[str] = None
+    video_config: Optional[Dict[str, Any]] = None
+    params: Optional[Dict[str, Any]] = None
+    workflow_params: Optional[Dict[str, Any]] = None
+
+
+def _build_workflow_params(request_data: CompletionRequest) -> Dict[str, Any]:
+    params = normalize_workflow_parameters(
+        request_data.video_config,
+        request_data.params,
+        request_data.workflow_params,
+    )
+    for key in ("duration", "resolution", "fps", "aspect_ratio"):
+        value = getattr(request_data, key, None)
+        if value is not None:
+            params[key] = value
+    return params
 
 
 VALID_API_KEY = fastapi_api_key
@@ -1386,6 +1418,7 @@ async def process_request(
             "image_count": len(image_path_list),
             "img_path1": img_path1,
             "img_path2": img_path2,
+            "workflow_param_keys": sorted(_build_workflow_params(request_data).keys()),
         },
     )
     _log_prompt_texts(
@@ -1412,6 +1445,7 @@ async def process_request(
         user_history=user_histories,
         request_id=request_id,
         progress_callback=progress_callback,
+        workflow_params=_build_workflow_params(request_data),
     )
 
     has_images = isinstance(images, dict) and any(images.values())
