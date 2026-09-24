@@ -70,6 +70,56 @@ class WorkflowParametersTest(unittest.TestCase):
         self.assertEqual(prompt["8"]["inputs"]["target_height"], 576)
         self.assertEqual(report["ignored"], [])
 
+    def test_size_and_video_parameters_update_workflow_inputs(self):
+        prompt = {
+            "8": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 512, "height": 512},
+            },
+            "12": {
+                "class_type": "VideoConfig",
+                "inputs": {"duration": 4, "fps": 16},
+            },
+        }
+
+        report = apply_workflow_parameters(
+            prompt,
+            {"size": "1536x1024", "duration": 8, "fps": 24},
+        )
+
+        self.assertEqual(prompt["8"]["inputs"]["width"], 1536)
+        self.assertEqual(prompt["8"]["inputs"]["height"], 1024)
+        self.assertEqual(prompt["12"]["inputs"]["duration"], 8)
+        self.assertEqual(prompt["12"]["inputs"]["fps"], 24)
+        self.assertEqual(report["ignored"], [])
+
+    def test_video_resolution_maps_to_comfy_resolution_selector_megapixels(self):
+        prompt = {
+            "7": {
+                "class_type": "ResolutionSelector",
+                "inputs": {
+                    "aspect_ratio": "16:9 (Widescreen)",
+                    "megapixels": 0.5,
+                    "preview": [],
+                    "multiple": 32,
+                },
+            },
+            "12": {
+                "class_type": "VideoConfig",
+                "inputs": {"duration": 4},
+            },
+        }
+
+        report = apply_workflow_parameters(
+            prompt,
+            {"resolution": 0.9, "duration": 8},
+        )
+
+        self.assertEqual(prompt["7"]["inputs"]["megapixels"], 0.9)
+        self.assertEqual(prompt["12"]["inputs"]["duration"], 8)
+        self.assertEqual(report["applied"], ["12.duration", "7.megapixels"])
+        self.assertEqual(report["ignored"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

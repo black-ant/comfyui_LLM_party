@@ -23,6 +23,9 @@ _KEY_ALIASES = {
     "video_fps": "fps",
     "videoresolution": "resolution",
     "video_resolution": "resolution",
+    "megapixel": "megapixels",
+    "megapixels": "megapixels",
+    "video_megapixels": "megapixels",
     "framerate": "fps",
     "frame_rate": "fps",
     "framespersecond": "fps",
@@ -34,6 +37,7 @@ _INPUT_ALIASES = {
     "duration": ("duration", "seconds", "video_duration", "videoDuration"),
     "fps": ("fps", "frame_rate", "frameRate", "video_fps", "videoFps"),
     "resolution": ("resolution", "video_resolution", "videoResolution"),
+    "megapixels": ("megapixels", "mega_pixels", "megapixel"),
     "width": ("width",),
     "height": ("height",),
 }
@@ -133,14 +137,22 @@ def apply_workflow_parameters(
         if parameter_name in _CONTROL_KEYS or parameter_name in applied_keys:
             continue
 
-        aliases = _INPUT_ALIASES.get(parameter_name, (parameter_name,))
-        targets = _apply_matching_inputs(
-            prompt,
-            aliases,
-            value,
-            locked_targets,
-            report["applied"],
-        )
+        if parameter_name == "resolution":
+            targets = _apply_resolution_input(
+                prompt,
+                value,
+                locked_targets,
+                report["applied"],
+            )
+        else:
+            aliases = _INPUT_ALIASES.get(parameter_name, (parameter_name,))
+            targets = _apply_matching_inputs(
+                prompt,
+                aliases,
+                value,
+                locked_targets,
+                report["applied"],
+            )
         if targets:
             applied_keys.add(parameter_name)
 
@@ -283,6 +295,33 @@ def _apply_matching_inputs(
     return count
 
 
+def _apply_resolution_input(
+    prompt: Mapping[str, Any],
+    value: Any,
+    locked_targets: set,
+    applied: list,
+) -> int:
+    megapixels = _positive_float(value)
+    if megapixels is not None:
+        targets = _apply_matching_inputs(
+            prompt,
+            _INPUT_ALIASES["megapixels"],
+            megapixels,
+            locked_targets,
+            applied,
+        )
+        if targets:
+            return targets
+
+    return _apply_matching_inputs(
+        prompt,
+        _INPUT_ALIASES["resolution"],
+        value,
+        locked_targets,
+        applied,
+    )
+
+
 def _derive_dimensions(parameters: Mapping[str, Any]) -> Dict[str, int]:
     width = _positive_int(parameters.get("width"))
     height = _positive_int(parameters.get("height"))
@@ -304,8 +343,10 @@ def _derive_dimensions(parameters: Mapping[str, Any]) -> Dict[str, int]:
     parsed_resolution = _parse_resolution_dimensions(resolution)
     if parsed_resolution and not (width or height):
         base_width, base_height = parsed_resolution
-        if _close_ratio(base_width, base_height, ratio):
-            return {"width": base_width, "height": base_height}
+        return {"width": base_width, "height": base_height}
+
+    if _positive_float(resolution) is not None and not (width or height):
+        return {}
 
     short_edge = _parse_short_edge(resolution) or 1024
     if width:
@@ -383,11 +424,15 @@ def _positive_int(value: Any) -> Optional[int]:
     return parsed if parsed > 0 else None
 
 
+def _positive_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def _align_dimension(value: float) -> int:
     return max(8, int(math.floor(value / 8 + 0.5) * 8))
-
-
-def _close_ratio(width: int, height: int, ratio: float) -> bool:
-    if height <= 0:
-        return False
-    return abs((width / height) - ratio) < 0.02

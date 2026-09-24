@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
@@ -1027,9 +1027,13 @@ class CompletionRequest(BaseModel):
     stream: bool = False
     storage_profile: Optional[str] = None
     duration: Optional[int] = None
-    resolution: Optional[str] = None
+    size: Optional[str] = None
+    resolution: Optional[Union[float, str]] = None
     fps: Optional[int] = None
     aspect_ratio: Optional[str] = None
+    ratio: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
     video_config: Optional[Dict[str, Any]] = None
     params: Optional[Dict[str, Any]] = None
     workflow_params: Optional[Dict[str, Any]] = None
@@ -1041,7 +1045,7 @@ def _build_workflow_params(request_data: CompletionRequest) -> Dict[str, Any]:
         request_data.params,
         request_data.workflow_params,
     )
-    for key in ("duration", "resolution", "fps", "aspect_ratio"):
+    for key in ("duration", "size", "resolution", "fps", "aspect_ratio", "ratio", "width", "height"):
         value = getattr(request_data, key, None)
         if value is not None:
             params[key] = value
@@ -1238,6 +1242,25 @@ async def stream_completion_with_heartbeat(request_data: CompletionRequest, requ
                 progress_waiter = asyncio.create_task(progress_queue.get())
 
             if task in done:
+                await asyncio.sleep(0)
+                if progress_waiter.done() and not progress_waiter.cancelled():
+                    yield _build_stream_sse_frame(
+                        model_name=request_data.model,
+                        delta={},
+                        progress=progress_waiter.result(),
+                    )
+                elif not progress_waiter.done():
+                    progress_waiter.cancel()
+                while True:
+                    try:
+                        pending_progress = progress_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    yield _build_stream_sse_frame(
+                        model_name=request_data.model,
+                        delta={},
+                        progress=pending_progress,
+                    )
                 try:
                     response = task.result()
                 except Exception as exc:
