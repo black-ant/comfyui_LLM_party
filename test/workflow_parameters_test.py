@@ -243,6 +243,20 @@ class WorkflowParametersTest(unittest.TestCase):
         self.assertEqual(prompt["12"]["inputs"]["fps"], 24)
         self.assertEqual(report["ignored"], [])
 
+    def test_video_size_alias_updates_workflow_dimensions(self):
+        prompt = {
+            "8": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 512, "height": 512},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"videoSize": "1536x1024"})
+
+        self.assertEqual(prompt["8"]["inputs"]["width"], 1536)
+        self.assertEqual(prompt["8"]["inputs"]["height"], 1024)
+        self.assertEqual(report["ignored"], [])
+
     def test_video_resolution_maps_to_comfy_resolution_selector_megapixels(self):
         prompt = {
             "7": {

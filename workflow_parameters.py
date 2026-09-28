@@ -23,6 +23,8 @@ _KEY_ALIASES = {
     "video_fps": "fps",
     "videoresolution": "resolution",
     "video_resolution": "resolution",
+    "videosize": "size",
+    "video_size": "size",
     "megapixel": "megapixels",
     "megapixels": "megapixels",
     "video_megapixels": "megapixels",

@@ -121,6 +121,65 @@ def _json_dumps_for_log(value):
         return str(value)
 
 
+_LOG_SENSITIVE_KEYS = {
+    "authorization",
+    "proxy_authorization",
+    "cookie",
+    "api_key",
+    "apikey",
+    "x_api_key",
+    "access_token",
+    "token",
+    "secret",
+    "secret_key",
+    "password",
+    "ms_token",
+    "x_bogus",
+    "x_gnarly",
+}
+_LOG_PRIVATE_KEYS = {
+    "messages",
+    "content",
+    "file_content",
+    "image_input",
+    "image_url",
+    "image_urls",
+    "video_url",
+    "video_urls",
+    "media",
+    "file_urls",
+    "references",
+    "system_prompt",
+    "user_prompt",
+    "positive_prompt",
+    "negative_prompt",
+}
+
+
+def _redact_log_value(value, key=""):
+    normalized_key = str(key).strip().lower().replace("-", "_")
+    if normalized_key in _LOG_SENSITIVE_KEYS:
+        return "<redacted>"
+    if normalized_key in _LOG_PRIVATE_KEYS:
+        if isinstance(value, dict):
+            return {"redacted": True, "keys": sorted(str(item) for item in value)}
+        if isinstance(value, (list, tuple)):
+            return {"redacted": True, "count": len(value)}
+        return {"redacted": True, "chars": len(str(value or ""))}
+    if isinstance(value, dict):
+        return {str(item_key): _redact_log_value(item_value, item_key) for item_key, item_value in value.items()}
+    if isinstance(value, (list, tuple)):
+        if len(value) > 20:
+            return {
+                "items": [_redact_log_value(item) for item in value[:20]],
+                "truncated_count": len(value) - 20,
+            }
+        return [_redact_log_value(item) for item in value]
+    if isinstance(value, str) and len(value) > 512:
+        return f"<truncated:{len(value)} chars>"
+    return value
+
+
 def _is_json_serializable(value):
     try:
         json.dumps(value)
@@ -130,7 +189,7 @@ def _is_json_serializable(value):
 
 
 def _log_request(stage: str, request_id: str, payload):
-    print(f"[FASTAPI][{request_id}][{stage}] {_json_dumps_for_log(payload)}")
+    print(f"[FASTAPI][{request_id}][{stage}] {_json_dumps_for_log(_redact_log_value(payload))}")
 
 
 def _safe_preview(value: str, max_len: int = 160):
@@ -148,12 +207,14 @@ def _log_prompt_texts(
     positive_prompt: str,
     negative_prompt: str,
 ):
-    # Keep prompt logs human-readable in terminal output.
     print(f"[FASTAPI][{request_id}][PROMPT][workflow] {workflow_path}")
-    print(f"[FASTAPI][{request_id}][PROMPT][system] {system_prompt}")
-    print(f"[FASTAPI][{request_id}][PROMPT][user] {user_prompt}")
-    print(f"[FASTAPI][{request_id}][PROMPT][positive] {positive_prompt}")
-    print(f"[FASTAPI][{request_id}][PROMPT][negative] {negative_prompt}")
+    for name, value in (
+        ("system", system_prompt),
+        ("user", user_prompt),
+        ("positive", positive_prompt),
+        ("negative", negative_prompt),
+    ):
+        print(f"[FASTAPI][{request_id}][PROMPT][{name}] chars={len(str(value or ''))}")
 
 def resolve_public_base_url(request: Optional[Request] = None):
     cli_public_base_url = (args.public_base_url or "").strip()

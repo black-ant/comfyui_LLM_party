@@ -4,14 +4,6 @@
 
 ## Shared Local Skills
 
-<<<<<<< HEAD
-Use the shared local skill below when the task matches its scope:
-
-- `page-style-linear-flow`: `D:\code\open_source\ant-ready-start\skills\page-style-linear-flow\SKILL.md`
-
-Apply it for frontend page design or refactors involving pages, admin panels, forms, tables, dashboards, detail views, wizards, modal/drawer placement, or multi-step flows.
-
-=======
 Use the shared local skills below when the task matches their scope:
 
 - `page-style-linear-flow`: `D:\code\open_source\ant-ready-start\skills\page-style-linear-flow\SKILL.md`
@@ -29,8 +21,6 @@ Apply `frontend-skill` when the task needs stronger frontend art direction, visu
 Apply `create-plan` when the user explicitly asks for a plan, task breakdown, implementation roadmap, rollout outline, or a step-by-step execution plan before coding.
 
 Apply `create-plan-doc` when the user explicitly asks for a plan that should also be saved into the repository as a markdown document under `docs/plan`.
-
->>>>>>> c0c447ee9f351c1e58e9451352ee2f9741f01658
 Core expectations:
 
 - Keep each page focused on one primary responsibility.
