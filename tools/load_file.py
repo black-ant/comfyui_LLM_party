@@ -262,6 +262,13 @@ class start_workflow:
                 "negative_prompt": ("STRING", {"default": ""}),
                 "model_name": ("STRING", {"default": ""}),
                 "user_history": ("STRING", {"default": ""}),
+                "duration": ("INT", {"default": 5, "min": 0, "max": 120, "step": 1}),
+                "fps": ("INT", {"default": 16, "min": 0, "max": 120, "step": 1}),
+                "resolution": ("STRING", {"default": ""}),
+                "aspect_ratio": ("STRING", {"default": ""}),
+                "size": ("STRING", {"default": ""}),
+                "width": ("INT", {"default": 640, "min": 0, "max": 8192, "step": 8}),
+                "height": ("INT", {"default": 640, "min": 0, "max": 8192, "step": 8}),
             },
         }
 
@@ -308,6 +315,13 @@ class start_workflow:
         negative_prompt="",
         model_name="",
         user_history="",
+        duration=5,
+        fps=16,
+        resolution="",
+        aspect_ratio="",
+        size="",
+        width=640,
+        height=640,
     ):
         file_out = []
         if file_content is not None and file_content != "":

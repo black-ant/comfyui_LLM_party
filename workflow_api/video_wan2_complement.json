@@ -305,7 +305,14 @@
       "positive_prompt": "",
       "negative_prompt": "",
       "model_name": "",
-      "user_history": ""
+      "user_history": "",
+      "duration": 5,
+      "fps": 16,
+      "resolution": "",
+      "aspect_ratio": "",
+      "size": "",
+      "width": 640,
+      "height": 640
     },
     "class_type": "start_workflow",
     "_meta": {

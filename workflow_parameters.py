@@ -130,8 +130,25 @@ def apply_workflow_parameters(
             if key not in values:
                 values[key] = value
         for key in ("aspect_ratio", "ratio", "resolution", "size"):
-            if key in values:
-                applied_keys.add(key)
+            if key not in values:
+                continue
+            if key == "resolution":
+                _apply_resolution_input(
+                    prompt,
+                    values[key],
+                    locked_targets,
+                    report["applied"],
+                )
+            else:
+                aliases = _INPUT_ALIASES.get(key, (key,))
+                _apply_matching_inputs(
+                    prompt,
+                    aliases,
+                    values[key],
+                    locked_targets,
+                    report["applied"],
+                )
+            applied_keys.add(key)
 
     if _apply_preset_duration(
         prompt,
