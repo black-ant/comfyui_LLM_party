@@ -111,6 +111,49 @@ class WorkflowParametersTest(unittest.TestCase):
         self.assertEqual(prompt['86']['inputs']['fps'], 24)
         self.assertEqual(report['ignored'], [])
 
+    def test_wan_preset_preserves_connected_parameter_outputs(self):
+        prompt = {
+            '81': {
+                'class_type': 'WanFirstLastFrameToVideo',
+                'inputs': {
+                    'width': ['97', 14],
+                    'height': ['97', 15],
+                    'length': ['97', 16],
+                },
+            },
+            '86': {
+                'class_type': 'CreateVideo',
+                'inputs': {'fps': ['97', 10]},
+            },
+            '97': {
+                'class_type': 'start_workflow',
+                'inputs': {
+                    'duration': 5,
+                    'fps': 16,
+                    'resolution': '',
+                    'aspect_ratio': '',
+                    'width': 640,
+                    'height': 640,
+                },
+            },
+        }
+
+        report = apply_workflow_parameters(
+            prompt,
+            {'duration': 6, 'fps': 24, 'aspect_ratio': '16:9', 'resolution': '720p'},
+        )
+
+        self.assertEqual(prompt['81']['inputs']['width'], ['97', 14])
+        self.assertEqual(prompt['81']['inputs']['height'], ['97', 15])
+        self.assertEqual(prompt['81']['inputs']['length'], ['97', 16])
+        self.assertEqual(prompt['86']['inputs']['fps'], ['97', 10])
+        self.assertEqual(prompt['97']['inputs']['duration'], 6)
+        self.assertEqual(prompt['97']['inputs']['fps'], 24)
+        self.assertEqual(prompt['97']['inputs']['width'], 1280)
+        self.assertEqual(prompt['97']['inputs']['height'], 720)
+        self.assertEqual(report['derived']['wan_length'], 145)
+        self.assertEqual(report['ignored'], [])
+
     def test_aspect_ratio_derives_dimensions_and_updates_matching_nodes(self):
         prompt = {
             "8": {

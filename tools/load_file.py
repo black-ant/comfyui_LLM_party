@@ -282,6 +282,14 @@ class start_workflow:
         "STRING",
         "STRING",
         "STRING",
+        "INT",
+        "INT",
+        "STRING",
+        "STRING",
+        "STRING",
+        "INT",
+        "INT",
+        "INT",
     )
     RETURN_NAMES = (
         "file_content",
@@ -293,6 +301,14 @@ class start_workflow:
         "negative_prompt",
         "model_name",
         "user_history",
+        "duration",
+        "fps",
+        "resolution",
+        "aspect_ratio",
+        "size",
+        "width",
+        "height",
+        "frame_count",
     )
 
     FUNCTION = "load_all"
@@ -418,6 +434,23 @@ class start_workflow:
         negative_out = negative_prompt
         model_name_out = model_name
         user_history_out = user_history
+        try:
+            duration_out = max(0, int(duration))
+        except (TypeError, ValueError):
+            duration_out = 5
+        try:
+            fps_out = max(1, int(fps))
+        except (TypeError, ValueError):
+            fps_out = 16
+        try:
+            width_out = int(width)
+        except (TypeError, ValueError):
+            width_out = 640
+        try:
+            height_out = int(height)
+        except (TypeError, ValueError):
+            height_out = 640
+        frame_count_out = max(1, int(round(duration_out * fps_out)) + 1)
         return (
             file_out,
             img_out,
@@ -428,6 +461,14 @@ class start_workflow:
             negative_out,
             model_name_out,
             user_history_out,
+            duration_out,
+            fps_out,
+            str(resolution or ""),
+            str(aspect_ratio or ""),
+            str(size or ""),
+            width_out,
+            height_out,
+            frame_count_out,
         )
 
 

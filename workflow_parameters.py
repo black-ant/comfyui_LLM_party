@@ -209,6 +209,15 @@ def _iter_nodes(prompt: Mapping[str, Any]) -> Iterable[Tuple[str, Mapping[str, A
         yield str(node_id), node
 
 
+def _is_linked_input(value: Any) -> bool:
+    return (
+        isinstance(value, (list, tuple))
+        and len(value) == 2
+        and isinstance(value[1], int)
+        and isinstance(value[0], (str, int))
+    )
+
+
 def _iter_node_overrides(parameters: Mapping[str, Any]) -> Iterable[Tuple[str, Mapping[str, Any]]]:
     raw_overrides = parameters.get("node_overrides") or parameters.get("nodes")
     if not isinstance(raw_overrides, Mapping):
@@ -317,6 +326,8 @@ def _apply_matching_inputs(
         for input_name in list(inputs.keys()):
             if input_name not in alias_set or (node_id, input_name) in locked_targets:
                 continue
+            if _is_linked_input(inputs[input_name]):
+                continue
             inputs[input_name] = value
             applied.append(f"{node_id}.{input_name}")
             count += 1
@@ -369,17 +380,21 @@ def _apply_preset_duration(
 
     length = max(1, int(round(duration * fps)) + 1)
     applied_any = False
+    found_wan_node = False
     for node_id, node in _iter_nodes(prompt):
         if node.get('class_type') != 'WanFirstLastFrameToVideo':
             continue
+        found_wan_node = True
         if 'length' not in node['inputs'] or (node_id, 'length') in locked_targets:
+            continue
+        if _is_linked_input(node['inputs']['length']):
             continue
         node['inputs']['length'] = length
         locked_targets.add((node_id, 'length'))
         applied.append(f'{node_id}.length')
         applied_any = True
 
-    if applied_any:
+    if found_wan_node:
         derived['wan_length'] = length
     return applied_any
 
