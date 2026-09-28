@@ -143,7 +143,9 @@ def apply_workflow_parameters(
         applied_keys.add('duration')
 
     for parameter_name, value in values.items():
-        if parameter_name in _CONTROL_KEYS or parameter_name in applied_keys:
+        if parameter_name in _CONTROL_KEYS or (
+            parameter_name in applied_keys and parameter_name != 'duration'
+        ):
             continue
 
         if parameter_name == "resolution":

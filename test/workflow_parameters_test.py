@@ -40,6 +40,28 @@ class WorkflowParametersTest(unittest.TestCase):
         self.assertEqual(prompt['86']['inputs']['fps'], 24)
         self.assertEqual(report['ignored'], [])
 
+    def test_wan_duration_conversion_preserves_direct_duration_inputs(self):
+        prompt = {
+            '81': {
+                'class_type': 'WanFirstLastFrameToVideo',
+                'inputs': {'length': 81},
+            },
+            '86': {
+                'class_type': 'CreateVideo',
+                'inputs': {'fps': 16},
+            },
+            '12': {
+                'class_type': 'VideoConfig',
+                'inputs': {'duration': 4},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {'duration': 6})
+
+        self.assertEqual(prompt['81']['inputs']['length'], 97)
+        self.assertEqual(prompt['12']['inputs']['duration'], 6)
+        self.assertEqual(report['ignored'], [])
+
     def test_aspect_ratio_derives_dimensions_and_updates_matching_nodes(self):
         prompt = {
             "8": {
