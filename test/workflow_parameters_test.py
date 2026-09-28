@@ -4,6 +4,42 @@ from workflow_parameters import apply_workflow_parameters
 
 
 class WorkflowParametersTest(unittest.TestCase):
+    def test_wan_preset_converts_duration_to_length_using_preset_fps(self):
+        prompt = {
+            '81': {
+                'class_type': 'WanFirstLastFrameToVideo',
+                'inputs': {'length': 81},
+            },
+            '86': {
+                'class_type': 'CreateVideo',
+                'inputs': {'fps': 16},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {'duration': 6})
+
+        self.assertEqual(prompt['81']['inputs']['length'], 97)
+        self.assertEqual(report['derived']['wan_length'], 97)
+        self.assertEqual(report['ignored'], [])
+
+    def test_wan_preset_uses_requested_fps_for_duration_conversion(self):
+        prompt = {
+            '81': {
+                'class_type': 'WanFirstLastFrameToVideo',
+                'inputs': {'length': 81},
+            },
+            '86': {
+                'class_type': 'CreateVideo',
+                'inputs': {'fps': 16},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {'duration': 5, 'fps': 24})
+
+        self.assertEqual(prompt['81']['inputs']['length'], 121)
+        self.assertEqual(prompt['86']['inputs']['fps'], 24)
+        self.assertEqual(report['ignored'], [])
+
     def test_aspect_ratio_derives_dimensions_and_updates_matching_nodes(self):
         prompt = {
             "8": {

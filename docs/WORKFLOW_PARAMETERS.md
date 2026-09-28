@@ -54,3 +54,11 @@
 ```
 
 `ant-ai-2api` 的 ComfyUI 视频适配器会透传 `duration`、`resolution`、`fps`、`aspect_ratio` 和 `Params` 到 `workflow_params`。
+
+对于预置的 Wan 首尾帧视频工作流，处理器会自动将 `duration`（秒）转换为 `WanFirstLastFrameToVideo.length`（帧数）：
+
+```text
+length = round(duration * fps) + 1
+```
+
+`fps` 优先使用请求参数；请求未传入时，读取预置 `CreateVideo.fps`。

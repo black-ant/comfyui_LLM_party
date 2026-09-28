@@ -133,6 +133,15 @@ def apply_workflow_parameters(
             if key in values:
                 applied_keys.add(key)
 
+    if _apply_preset_duration(
+        prompt,
+        values,
+        locked_targets,
+        report['applied'],
+        report['derived'],
+    ):
+        applied_keys.add('duration')
+
     for parameter_name, value in values.items():
         if parameter_name in _CONTROL_KEYS or parameter_name in applied_keys:
             continue
@@ -320,6 +329,54 @@ def _apply_resolution_input(
         locked_targets,
         applied,
     )
+
+
+def _apply_preset_duration(
+    prompt: Mapping[str, Any],
+    parameters: Mapping[str, Any],
+    locked_targets: set,
+    applied: list,
+    derived: Dict[str, Any],
+) -> bool:
+    duration = _positive_float(parameters.get('duration'))
+    if duration is None:
+        return False
+
+    fps = _positive_float(parameters.get('fps'))
+    if fps is None:
+        fps = _find_node_input(prompt, 'CreateVideo', 'fps')
+    if fps is None:
+        return False
+
+    length = max(1, int(round(duration * fps)) + 1)
+    applied_any = False
+    for node_id, node in _iter_nodes(prompt):
+        if node.get('class_type') != 'WanFirstLastFrameToVideo':
+            continue
+        if 'length' not in node['inputs'] or (node_id, 'length') in locked_targets:
+            continue
+        node['inputs']['length'] = length
+        locked_targets.add((node_id, 'length'))
+        applied.append(f'{node_id}.length')
+        applied_any = True
+
+    if applied_any:
+        derived['wan_length'] = length
+    return applied_any
+
+
+def _find_node_input(
+    prompt: Mapping[str, Any],
+    class_type: str,
+    input_name: str,
+) -> Optional[float]:
+    for _, node in _iter_nodes(prompt):
+        if node.get('class_type') != class_type:
+            continue
+        value = _positive_float(node['inputs'].get(input_name))
+        if value is not None:
+            return value
+    return None
 
 
 def _derive_dimensions(parameters: Mapping[str, Any]) -> Dict[str, int]:
