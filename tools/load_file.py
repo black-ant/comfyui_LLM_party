@@ -282,8 +282,8 @@ class start_workflow:
         "STRING",
         "STRING",
         "STRING",
-        "INT",
-        "INT",
+        "FLOAT",
+        "FLOAT",
         "STRING",
         "STRING",
         "STRING",
@@ -435,13 +435,13 @@ class start_workflow:
         model_name_out = model_name
         user_history_out = user_history
         try:
-            duration_out = max(0, int(duration))
+            duration_out = max(0.0, float(duration))
         except (TypeError, ValueError):
-            duration_out = 5
+            duration_out = 5.0
         try:
-            fps_out = max(1, int(fps))
+            fps_out = max(1.0, float(fps))
         except (TypeError, ValueError):
-            fps_out = 16
+            fps_out = 16.0
         try:
             width_out = int(width)
         except (TypeError, ValueError):
