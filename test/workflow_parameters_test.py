@@ -250,6 +250,21 @@ class WorkflowParametersTest(unittest.TestCase):
                 "9:16 (Portrait Widescreen)",
             )
 
+    def test_approximate_numeric_aspect_ratio_maps_to_comfy_label(self):
+        prompt = {
+            "7": {
+                "class_type": "ResolutionSelector",
+                "inputs": {"aspect_ratio": "1:1 (Square)"},
+            },
+        }
+
+        apply_workflow_parameters(prompt, {"aspect_ratio": 1.7777778})
+
+        self.assertEqual(
+            prompt["7"]["inputs"]["aspect_ratio"],
+            "16:9 (Widescreen)",
+        )
+
     def test_all_standard_aspect_ratio_presets_map_to_comfy_labels(self):
         presets = [
             ("1:1", "1:1 (Square)"),

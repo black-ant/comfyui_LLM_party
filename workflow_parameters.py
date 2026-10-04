@@ -46,6 +46,7 @@ _INPUT_ALIASES = {
 }
 
 _ASPECT_RATIO_INPUT_NAMES = frozenset(_INPUT_ALIASES["aspect_ratio"])
+_ASPECT_RATIO_MATCH_TOLERANCE = 1e-6
 _ASPECT_RATIO_PRESETS = (
     (1.0, "1:1", "1:1 (Square)"),
     (2.0 / 3.0, "2:3", "2:3 (Portrait Photo)"),
@@ -390,7 +391,12 @@ def _normalize_aspect_ratio_for_target(
 
 def _find_aspect_ratio_preset(ratio: float):
     for preset in _ASPECT_RATIO_PRESETS:
-        if math.isclose(ratio, preset[0], rel_tol=0.0, abs_tol=1e-9):
+        if math.isclose(
+            ratio,
+            preset[0],
+            rel_tol=_ASPECT_RATIO_MATCH_TOLERANCE,
+            abs_tol=_ASPECT_RATIO_MATCH_TOLERANCE,
+        ):
             return preset
     return None
 
