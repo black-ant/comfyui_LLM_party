@@ -172,6 +172,126 @@ class WorkflowParametersTest(unittest.TestCase):
         self.assertEqual(prompt["8"]["inputs"]["batch_size"], 2)
         self.assertEqual(report["ignored"], [])
 
+    def test_aspect_ratio_shorthand_maps_to_resolution_selector_label(self):
+        prompt = {
+            "7": {
+                "class_type": "ResolutionSelector",
+                "inputs": {
+                    "aspect_ratio": "1:1 (Square)",
+                    "megapixels": 0.9,
+                    "multiple": 32,
+                },
+            },
+            "97": {
+                "class_type": "start_workflow",
+                "inputs": {
+                    "aspect_ratio": "",
+                    "width": 640,
+                    "height": 640,
+                },
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"aspect_ratio": "9:16"})
+
+        self.assertEqual(
+            prompt["7"]["inputs"]["aspect_ratio"],
+            "9:16 (Portrait Widescreen)",
+        )
+        self.assertEqual(prompt["97"]["inputs"]["aspect_ratio"], "9:16")
+        self.assertEqual(report["ignored"], [])
+
+    def test_aspect_ratio_adapts_to_label_raw_numeric_and_alias_inputs(self):
+        prompt = {
+            "selector": {
+                "class_type": "ResolutionSelector",
+                "inputs": {"aspect_ratio": "16:9 (Widescreen)"},
+            },
+            "raw": {
+                "class_type": "RawRatioNode",
+                "inputs": {"aspect_ratio": "16:9"},
+            },
+            "numeric": {
+                "class_type": "NumericRatioNode",
+                "inputs": {"ratio": 1.0},
+            },
+            "auto": {
+                "class_type": "AutoRatioNode",
+                "inputs": {"aspect_ratio": "auto"},
+            },
+        }
+
+        apply_workflow_parameters(prompt, {"aspect_ratio": 0.5625})
+
+        self.assertEqual(
+            prompt["selector"]["inputs"]["aspect_ratio"],
+            "9:16 (Portrait Widescreen)",
+        )
+        self.assertEqual(prompt["raw"]["inputs"]["aspect_ratio"], "9:16")
+        self.assertEqual(prompt["numeric"]["inputs"]["ratio"], 0.5625)
+        self.assertEqual(prompt["auto"]["inputs"]["aspect_ratio"], "9:16")
+
+    def test_aspect_ratio_parser_accepts_labels_slashes_x_and_numbers(self):
+        prompt = {
+            str(index): {
+                "class_type": "ResolutionSelector",
+                "inputs": {"aspect_ratio": "1:1 (Square)"},
+            }
+            for index in range(4)
+        }
+
+        values = ["9:16", "9/16", "9x16", "9:16 (Portrait Widescreen)"]
+        for node_id, value in zip(prompt, values):
+            apply_workflow_parameters({node_id: prompt[node_id]}, {"aspect_ratio": value})
+
+        for node in prompt.values():
+            self.assertEqual(
+                node["inputs"]["aspect_ratio"],
+                "9:16 (Portrait Widescreen)",
+            )
+
+    def test_all_standard_aspect_ratio_presets_map_to_comfy_labels(self):
+        presets = [
+            ("1:1", "1:1 (Square)"),
+            ("2:3", "2:3 (Portrait Photo)"),
+            ("3:2", "3:2 (Photo)"),
+            ("3:4", "3:4 (Portrait Standard)"),
+            ("4:3", "4:3 (Standard)"),
+            ("9:16", "9:16 (Portrait Widescreen)"),
+            ("16:9", "16:9 (Widescreen)"),
+            ("21:9", "21:9 (Ultrawide)"),
+        ]
+
+        for value, expected in presets:
+            with self.subTest(value=value):
+                prompt = {
+                    "7": {
+                        "class_type": "ResolutionSelector",
+                        "inputs": {"aspect_ratio": "1:1 (Square)"},
+                    },
+                }
+
+                apply_workflow_parameters(prompt, {"aspect_ratio": value})
+
+                self.assertEqual(prompt["7"]["inputs"]["aspect_ratio"], expected)
+
+    def test_ratio_alias_uses_the_same_aspect_ratio_normalization(self):
+        prompt = {
+            "7": {
+                "class_type": "ResolutionSelector",
+                "inputs": {"aspect_ratio": "1:1 (Square)"},
+            },
+            "97": {
+                "class_type": "start_workflow",
+                "inputs": {"aspect_ratio": ""},
+            },
+        }
+
+        apply_workflow_parameters(prompt, {"ratio": "16:9"})
+
+        self.assertEqual(prompt["7"]["inputs"]["aspect_ratio"], "16:9 (Widescreen)")
+        self.assertEqual(prompt["97"]["inputs"]["aspect_ratio"], "16:9")
+
     def test_node_overrides_take_precedence_over_automatic_matching(self):
         prompt = {
             "8": {

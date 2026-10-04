@@ -1091,8 +1091,8 @@ class CompletionRequest(BaseModel):
     size: Optional[str] = None
     resolution: Optional[Union[float, str]] = None
     fps: Optional[int] = None
-    aspect_ratio: Optional[str] = None
-    ratio: Optional[str] = None
+    aspect_ratio: Optional[Union[str, float, int]] = None
+    ratio: Optional[Union[str, float, int]] = None
     width: Optional[int] = None
     height: Optional[int] = None
     video_config: Optional[Dict[str, Any]] = None

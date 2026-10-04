@@ -15,6 +15,7 @@ _CONTROL_KEYS = {
 _KEY_ALIASES = {
     "aspectratio": "aspect_ratio",
     "aspect_ratio": "aspect_ratio",
+    "ratio": "aspect_ratio",
     "videoaspectratio": "aspect_ratio",
     "video_aspect_ratio": "aspect_ratio",
     "videoduration": "duration",
@@ -43,6 +44,18 @@ _INPUT_ALIASES = {
     "width": ("width",),
     "height": ("height",),
 }
+
+_ASPECT_RATIO_INPUT_NAMES = frozenset(_INPUT_ALIASES["aspect_ratio"])
+_ASPECT_RATIO_PRESETS = (
+    (1.0, "1:1", "1:1 (Square)"),
+    (2.0 / 3.0, "2:3", "2:3 (Portrait Photo)"),
+    (3.0 / 2.0, "3:2", "3:2 (Photo)"),
+    (3.0 / 4.0, "3:4", "3:4 (Portrait Standard)"),
+    (4.0 / 3.0, "4:3", "4:3 (Standard)"),
+    (9.0 / 16.0, "9:16", "9:16 (Portrait Widescreen)"),
+    (16.0 / 9.0, "16:9", "16:9 (Widescreen)"),
+    (21.0 / 9.0, "21:9", "21:9 (Ultrawide)"),
+)
 
 _RESOLUTION_SHORT_EDGES = {
     "sd": 480,
@@ -106,7 +119,7 @@ def apply_workflow_parameters(
             if input_name not in node["inputs"]:
                 report["ignored"].append(f"{node_id}.{input_name}")
                 continue
-            node["inputs"][input_name] = value
+            node["inputs"][input_name] = _coerce_input_value(node, input_name, value)
             locked_targets.add(target)
             report["applied"].append(f"{node_id}.{input_name}")
 
@@ -280,7 +293,7 @@ def _apply_binding(
             continue
         if (str(node_id), str(input_name)) in locked_targets:
             continue
-        node["inputs"][input_name] = value
+        node["inputs"][input_name] = _coerce_input_value(node, input_name, value)
         locked_targets.add((str(node_id), str(input_name)))
         applied.append(f"{node_id}.{input_name}")
         applied_any = True
@@ -330,10 +343,63 @@ def _apply_matching_inputs(
                 continue
             if _is_linked_input(inputs[input_name]):
                 continue
-            inputs[input_name] = value
+            inputs[input_name] = _coerce_input_value(node, input_name, value)
             applied.append(f"{node_id}.{input_name}")
             count += 1
     return count
+
+
+def _coerce_input_value(node: Mapping[str, Any], input_name: str, value: Any) -> Any:
+    if input_name not in _ASPECT_RATIO_INPUT_NAMES:
+        return value
+
+    inputs = node.get("inputs")
+    current_value = inputs.get(input_name) if isinstance(inputs, Mapping) else None
+    use_labeled_default = node.get("class_type") == "ResolutionSelector"
+    return _normalize_aspect_ratio_for_target(value, current_value, use_labeled_default)
+
+
+def _normalize_aspect_ratio_for_target(
+    value: Any,
+    current_value: Any,
+    use_labeled_default: bool,
+) -> Any:
+    ratio = _parse_aspect_ratio(value)
+    if ratio is None or isinstance(current_value, bool):
+        return value
+
+    if isinstance(current_value, (int, float)):
+        return ratio
+
+    preset = _find_aspect_ratio_preset(ratio)
+    if preset is None:
+        return value
+
+    _, raw_value, labeled_value = preset
+    if _is_labeled_aspect_ratio(current_value):
+        return labeled_value
+    if use_labeled_default and (
+        current_value is None
+        or (isinstance(current_value, str) and not current_value.strip())
+    ):
+        return labeled_value
+    if isinstance(current_value, str) or current_value is None:
+        return raw_value
+    return value
+
+
+def _find_aspect_ratio_preset(ratio: float):
+    for preset in _ASPECT_RATIO_PRESETS:
+        if math.isclose(ratio, preset[0], rel_tol=0.0, abs_tol=1e-9):
+            return preset
+    return None
+
+
+def _is_labeled_aspect_ratio(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    text = value.strip()
+    return "(" in text and ")" in text and _parse_aspect_ratio(text) is not None
 
 
 def _apply_resolution_input(
@@ -456,21 +522,31 @@ def _derive_dimensions(parameters: Mapping[str, Any]) -> Dict[str, int]:
 
 
 def _parse_aspect_ratio(value: Any) -> Optional[float]:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return float(value) if float(value) > 0 else None
-    text = str(value).strip().lower().replace("／", "/")
-    if ":" in text:
-        left, right = text.split(":", 1)
-    elif "/" in text:
-        left, right = text.split("/", 1)
+        ratio = float(value)
+        return ratio if math.isfinite(ratio) and ratio > 0 else None
+
+    text = (
+        str(value)
+        .strip()
+        .lower()
+        .replace("／", "/")
+        .replace("：", ":")
+    )
+    match = re.fullmatch(
+        r"(\d+(?:\.\d+)?)\s*[:/x×]\s*(\d+(?:\.\d+)?)(?:\s*\([^)]*\))?",
+        text,
+    )
+    if match:
+        left, right = match.groups()
     else:
         try:
             ratio = float(text)
         except ValueError:
             return None
-        return ratio if ratio > 0 else None
+        return ratio if math.isfinite(ratio) and ratio > 0 else None
     try:
         left_value = float(left.strip())
         right_value = float(right.strip())
