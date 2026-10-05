@@ -369,20 +369,16 @@ def _normalize_aspect_ratio_for_target(
     if ratio is None or isinstance(current_value, bool):
         return value
 
-    if isinstance(current_value, (int, float)):
-        return ratio
-
     preset = _find_aspect_ratio_preset(ratio)
     if preset is None:
         return value
 
     _, raw_value, labeled_value = preset
-    if _is_labeled_aspect_ratio(current_value):
+    if use_labeled_default:
         return labeled_value
-    if use_labeled_default and (
-        current_value is None
-        or (isinstance(current_value, str) and not current_value.strip())
-    ):
+    if isinstance(current_value, (int, float)):
+        return ratio
+    if _is_labeled_aspect_ratio(current_value):
         return labeled_value
     if isinstance(current_value, str) or current_value is None:
         return raw_value
