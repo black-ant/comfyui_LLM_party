@@ -57,6 +57,8 @@
 
 `ant-ai-2api` 的 ComfyUI 视频适配器会透传 `duration`、`resolution`、`fps`、`aspect_ratio` 和 `Params` 到 `workflow_params`。
 
+工作流文件本身是参数来源的唯一事实：部署只同步 `comfyui_LLM_party/workflow_api/` 中实际存在的文件，不按模型名称套用统一工作流配置。当前仓库内的 H3 和 Wan 示例分别按自己的节点连接和默认值执行。
+
 对于预置的 Wan 首尾帧视频工作流，处理器会自动将 `duration`（秒）转换为 `WanFirstLastFrameToVideo.length`（帧数）：
 
 ```text

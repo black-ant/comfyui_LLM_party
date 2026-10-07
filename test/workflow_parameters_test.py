@@ -1,9 +1,48 @@
+import json
 import unittest
+from pathlib import Path
 
 from workflow_parameters import apply_workflow_parameters
 
 
+WORKFLOW_API_DIR = Path(__file__).resolve().parents[1] / "workflow_api"
+
+
 class WorkflowParametersTest(unittest.TestCase):
+    def test_checked_in_minimax_h3_workflows_apply_duration_to_real_nodes(self):
+        for workflow_name in (
+            "Mimax-H3-202609.json",
+            "Mimax-H3-202609-V2-time.json",
+        ):
+            with self.subTest(workflow_name=workflow_name):
+                prompt = json.loads(
+                    (WORKFLOW_API_DIR / workflow_name).read_text(encoding="utf-8")
+                )
+
+                report = apply_workflow_parameters(prompt, {"duration": 4})
+
+                h3_node = next(
+                    node
+                    for node in prompt.values()
+                    if node.get("class_type") == "MiniMaxH3ImageToVideo"
+                )
+                save_node = next(
+                    node
+                    for node in prompt.values()
+                    if node.get("class_type") == "SaveVideo"
+                )
+                trim_node_id = report["derived"]["minimax_h3_trim_node_ids"][0]
+
+                self.assertEqual(h3_node["inputs"]["length"], 107)
+                self.assertEqual(save_node["inputs"]["video"], [trim_node_id, 0])
+                self.assertEqual(prompt[trim_node_id]["class_type"], "Video Slice")
+                self.assertEqual(
+                    prompt[trim_node_id]["inputs"]["duration"],
+                    4.0,
+                )
+                self.assertTrue(prompt[trim_node_id]["inputs"]["strict_duration"])
+                self.assertEqual(report["ignored"], [])
+
     def test_minimax_h3_duration_converts_to_17k_plus_5_frame_length(self):
         prompt = {
             "81": {
