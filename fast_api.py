@@ -20,7 +20,7 @@ import httpx
 import requests
 import websocket
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 from storage_backends import create_storage_backend, load_storage_settings, parse_bool
@@ -117,6 +117,15 @@ def _get_comfyui_http_timeout_seconds():
     except ValueError:
         timeout_seconds = 30.0
     return max(1.0, min(timeout_seconds, 300.0))
+
+
+def _get_comfyui_unreachable_failure_threshold():
+    raw_value = os.getenv("COMFYUI_UNREACHABLE_FAILURES", "3").strip()
+    try:
+        failure_threshold = int(raw_value)
+    except ValueError:
+        failure_threshold = 3
+    return max(1, min(failure_threshold, 20))
 
 
 STREAM_HEARTBEAT_SECONDS = _get_stream_heartbeat_seconds()
@@ -232,6 +241,9 @@ def _exception_summary_payload(exc: Exception):
         "error_type": type(exc).__name__,
         "error": str(exc),
     }
+    exception_details = getattr(exc, "details", None)
+    if exception_details is not None:
+        payload["details"] = exception_details
     detail = getattr(exc, "detail", None)
     if detail is not None:
         payload["detail"] = detail
@@ -248,11 +260,29 @@ def _exception_summary_payload(exc: Exception):
                     response_body.decode("utf-8", errors="replace"),
                     4096,
                 )
+    if isinstance(exc, urllib.error.URLError):
+        payload["reason"] = str(exc.reason)
     return payload
 
 
+def _is_comfyui_unreachable_error(exc: Exception):
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, urllib.error.URLError):
+        reason = exc.reason
+        if isinstance(reason, (ConnectionError, TimeoutError, OSError)):
+            return True
+        return any(
+            marker in str(reason).lower()
+            for marker in ("connection refused", "connection reset", "timed out", "unreachable")
+        )
+    return isinstance(exc, (ConnectionError, TimeoutError, OSError))
+
+
 class ComfyUIWorkflowError(RuntimeError):
-    pass
+    def __init__(self, message: str, details=None):
+        super().__init__(message)
+        self.details = details
 
 
 def _history_error_details(history_entry):
@@ -292,7 +322,10 @@ def _raise_history_error(history_entry, request_id="", prompt_id=""):
     if prompt_id:
         details["prompt_id"] = prompt_id
     _log_request("workflow_execution_error", request_id, details)
-    raise ComfyUIWorkflowError("ComfyUI workflow failed: " + _safe_preview(_json_dumps_for_log(details), 4096))
+    raise ComfyUIWorkflowError(
+        "ComfyUI workflow failed: " + _safe_preview(_json_dumps_for_log(details), 4096),
+        details=details,
+    )
 
 
 def _safe_preview(value: str, max_len: int = 160):
@@ -849,6 +882,7 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
     poll_interval_seconds = _get_workflow_poll_interval_seconds()
     http_timeout_seconds = _get_comfyui_http_timeout_seconds()
     poll_failures = 0
+    unreachable_failures = 0
     try:
         progress_socket = websocket.create_connection(
             "ws://{}/ws?clientId={}".format(server_address, workflow_client_id),
@@ -860,11 +894,23 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
         progress_socket = None
 
     try:
-        prompt_id = queue_prompt(
-            prompt,
-            workflow_client_id,
-            timeout=http_timeout_seconds,
-        )["prompt_id"]
+        try:
+            prompt_id = queue_prompt(
+                prompt,
+                workflow_client_id,
+                timeout=http_timeout_seconds,
+            )["prompt_id"]
+        except Exception as queue_error:
+            queue_error_details = {
+                "status": "queue_error",
+                "server_address": server_address,
+                "error": _exception_summary_payload(queue_error),
+            }
+            _log_request("workflow_queue_error", request_id, queue_error_details)
+            raise ComfyUIWorkflowError(
+                "ComfyUI rejected the workflow prompt",
+                details=queue_error_details,
+            ) from queue_error
         _log_request(
             "workflow_prompt_queued",
             request_id,
@@ -922,6 +968,7 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
 
             try:
                 history = get_history(prompt_id, timeout=http_timeout_seconds)[prompt_id]
+                unreachable_failures = 0
                 _raise_history_error(history, request_id, prompt_id)
                 _emit_comfyui_progress(
                     progress_state,
@@ -935,6 +982,10 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
                 raise
             except Exception as history_error:
                 poll_failures += 1
+                if _is_comfyui_unreachable_error(history_error):
+                    unreachable_failures += 1
+                else:
+                    unreachable_failures = 0
                 elapsed_ms = int((time.monotonic() - poll_started_at) * 1000)
                 if poll_failures == 1 or poll_failures % 50 == 0:
                     history_error_payload = _exception_summary_payload(history_error)
@@ -948,6 +999,20 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
                         "history_poll_error",
                         request_id,
                         history_error_payload,
+                    )
+                if unreachable_failures >= _get_comfyui_unreachable_failure_threshold():
+                    unreachable_details = {
+                        "status": "upstream_unreachable",
+                        "server_address": server_address,
+                        "prompt_id": prompt_id,
+                        "attempt": poll_failures,
+                        "consecutive_unreachable_failures": unreachable_failures,
+                        "last_error": _exception_summary_payload(history_error),
+                    }
+                    _log_request("workflow_upstream_unreachable", request_id, unreachable_details)
+                    raise ComfyUIWorkflowError(
+                        "ComfyUI became unreachable while waiting for workflow history",
+                        details=unreachable_details,
                     )
                 if time.monotonic() - poll_started_at >= poll_timeout_seconds:
                     timeout_error = TimeoutError(
@@ -1576,6 +1641,32 @@ def _build_stream_sse_frame(
         payload["progress"] = progress
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
+
+def _completion_error_payload(exc: Exception, request_id: str, model_name: str = ""):
+    summary = _exception_summary_payload(exc)
+    error_message = getattr(exc, "detail", None)
+    if error_message is None or not str(error_message).strip():
+        error_message = str(exc)
+    if not isinstance(error_message, str):
+        error_message = _json_dumps_for_log(error_message)
+
+    error_payload = {
+        "id": "chatcmpl-" + str(uuid.uuid4()),
+        "object": "error",
+        "created": int(time.time()),
+        "model": model_name,
+        "error": {
+            "message": error_message,
+            "type": "comfyui_workflow_error" if isinstance(exc, ComfyUIWorkflowError) else type(exc).__name__,
+            "request_id": request_id,
+        },
+    }
+    if summary.get("details") is not None:
+        error_payload["error"]["details"] = summary["details"]
+    if summary.get("status_code") is not None:
+        error_payload["error"]["upstream_status_code"] = summary["status_code"]
+    return error_payload
+
 @app.post("/v1/chat/completions")
 async def create_completion(request_data: CompletionRequest, request: Request, dependency=Depends(verify_api_key)):
     request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
@@ -1606,7 +1697,15 @@ async def create_completion(request_data: CompletionRequest, request: Request, d
             response = await process_request(request_data, request, request_id=request_id)
         
         _log_request("completion_response", request_id, response)
-        return response
+        return JSONResponse(content=response, headers={"X-Request-ID": request_id})
+    except ComfyUIWorkflowError as exc:
+        error_payload = _completion_error_payload(exc, request_id, request_data.model)
+        _log_request("workflow_http_error", request_id, _exception_log_payload(exc))
+        return JSONResponse(
+            status_code=502,
+            content=error_payload,
+            headers={"X-Request-ID": request_id},
+        )
     except HTTPException as exc:
         _log_request(
             "http_exception",
@@ -1699,20 +1798,7 @@ async def stream_completion_with_heartbeat(request_data: CompletionRequest, requ
                     response = task.result()
                 except Exception as exc:
                     _log_request("stream_error", request_id, _exception_log_payload(exc))
-                    error_message = getattr(exc, "detail", None)
-                    if error_message is None or not str(error_message).strip():
-                        error_message = str(exc)
-                    error_payload = {
-                        "id": "chatcmpl-" + str(uuid.uuid4()),
-                        "object": "error",
-                        "created": int(time.time()),
-                        "model": request_data.model,
-                        "error": {
-                            "message": str(error_message),
-                            "type": type(exc).__name__,
-                            "request_id": request_id,
-                        },
-                    }
+                    error_payload = _completion_error_payload(exc, request_id, request_data.model)
                     yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
                     return
