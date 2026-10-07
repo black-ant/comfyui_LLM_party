@@ -51,6 +51,7 @@ dependencies = [
     "selenium",
     "librosa",
     "ffmpeg-python",
+    "av>=17.0.0",
     "moviepy",
     "html5lib",
     "easyocr",

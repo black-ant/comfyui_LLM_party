@@ -45,6 +45,26 @@ _INPUT_ALIASES = {
     "height": ("height",),
 }
 
+_MINIMAX_H3_LENGTH_NODES = frozenset({
+    "EmptyMiniMaxH3LatentAV",
+    "MiniMaxH3ImageToVideo",
+    "MiniMaxH3ReferenceToVideo",
+})
+_MINIMAX_H3_FPS = 24
+_VIDEO_OUTPUT_NODES = frozenset({
+    "SaveVideo",
+    "VideoCrop",
+    "VideoOutput",
+    "VideoTrim",
+})
+_VIDEO_INTERMEDIATE_NODES = frozenset({
+    "ConcatenateVideo",
+    "CreateVideo",
+    "GetVideoComponents",
+    "LoadVideo",
+})
+_VIDEO_SLICE_NODES = frozenset({"Video Slice", "VideoSlice"})
+
 _ASPECT_RATIO_INPUT_NAMES = frozenset(_INPUT_ALIASES["aspect_ratio"])
 _ASPECT_RATIO_MATCH_TOLERANCE = 1e-6
 _ASPECT_RATIO_PRESETS = (
@@ -174,6 +194,14 @@ def apply_workflow_parameters(
         report['derived'],
     ):
         applied_keys.add('duration')
+
+    if report["derived"].get("minimax_h3_length") is not None:
+        _apply_minimax_h3_exact_duration_trim(
+            prompt,
+            values.get("duration"),
+            report["applied"],
+            report["derived"],
+        )
 
     for parameter_name, value in values.items():
         if parameter_name in _CONTROL_KEYS or (
@@ -445,28 +473,185 @@ def _apply_preset_duration(
     fps = _positive_float(parameters.get('fps'))
     if fps is None:
         fps = _find_node_input(prompt, 'CreateVideo', 'fps')
-    if fps is None:
-        return False
-
-    length = max(1, int(round(duration * fps)) + 1)
+    wan_length = max(1, int(round(duration * fps)) + 1) if fps is not None else None
+    minimax_h3_length = _minimax_h3_length(duration)
     applied_any = False
     found_wan_node = False
+    found_minimax_h3_node = False
     for node_id, node in _iter_nodes(prompt):
-        if node.get('class_type') != 'WanFirstLastFrameToVideo':
+        class_type = node.get('class_type')
+        is_minimax_h3 = _is_minimax_h3_length_node(node)
+        if class_type == 'WanFirstLastFrameToVideo':
+            found_wan_node = True
+            length = wan_length
+        elif is_minimax_h3:
+            found_minimax_h3_node = True
+            length = minimax_h3_length
+        else:
             continue
-        found_wan_node = True
+        if length is None:
+            continue
         if 'length' not in node['inputs'] or (node_id, 'length') in locked_targets:
             continue
-        if _is_linked_input(node['inputs']['length']):
+        if not is_minimax_h3 and _is_linked_input(node['inputs']['length']):
             continue
         node['inputs']['length'] = length
         locked_targets.add((node_id, 'length'))
         applied.append(f'{node_id}.length')
         applied_any = True
 
-    if found_wan_node:
-        derived['wan_length'] = length
+    if found_wan_node and wan_length is not None:
+        derived['wan_length'] = wan_length
+    if found_minimax_h3_node:
+        derived['minimax_h3_length'] = minimax_h3_length
+        derived['minimax_h3_fps'] = _MINIMAX_H3_FPS
+        derived['minimax_h3_duration_seconds'] = round(
+            minimax_h3_length / _MINIMAX_H3_FPS,
+            3,
+        )
     return applied_any
+
+
+def _minimax_h3_length(duration: float) -> int:
+    requested_frames = max(5, int(round(duration * _MINIMAX_H3_FPS)))
+    return requested_frames + (5 - requested_frames) % 17
+
+
+def _is_minimax_h3_length_node(node: Mapping[str, Any]) -> bool:
+    if not isinstance(node, Mapping):
+        return False
+    inputs = node.get('inputs')
+    if not isinstance(inputs, Mapping) or 'length' not in inputs:
+        return False
+    class_type = str(node.get('class_type') or '')
+    if class_type in _MINIMAX_H3_LENGTH_NODES:
+        return True
+    normalized = re.sub(r'[^a-z0-9]', '', class_type.lower())
+    return 'minimaxh3' in normalized
+
+
+def _apply_minimax_h3_exact_duration_trim(
+    prompt: Dict[str, Any],
+    duration_value: Any,
+    applied: list,
+    derived: Dict[str, Any],
+) -> bool:
+    duration = _positive_float(duration_value)
+    if duration is None:
+        return False
+
+    trim_node_ids = []
+    output_node_ids = []
+    next_node_id = _next_numeric_node_id(prompt)
+    consumed_node_ids = _collect_consumed_node_ids(prompt)
+    for node_id, node in list(_iter_nodes(prompt)):
+        if not _is_video_output_node(node_id, node, consumed_node_ids):
+            continue
+        video_link = node["inputs"].get("video")
+        if not _is_linked_input(video_link):
+            continue
+
+        output_node_ids.append(node_id)
+        source_node_id = str(video_link[0])
+        source_node = prompt.get(source_node_id)
+        if (
+            isinstance(source_node, Mapping)
+            and str(source_node.get("class_type") or "") in _VIDEO_SLICE_NODES
+            and isinstance(source_node.get("inputs"), dict)
+        ):
+            source_node["inputs"]["start_time"] = 0.0
+            source_node["inputs"]["duration"] = duration
+            source_node["inputs"]["strict_duration"] = True
+            trim_node_ids.append(source_node_id)
+            applied.extend(
+                [
+                    f"{source_node_id}.start_time",
+                    f"{source_node_id}.duration",
+                    f"{source_node_id}.strict_duration",
+                ]
+            )
+            continue
+
+        while str(next_node_id) in prompt:
+            next_node_id += 1
+        trim_node_id = str(next_node_id)
+        next_node_id += 1
+        prompt[trim_node_id] = {
+            "inputs": {
+                "video": video_link,
+                "start_time": 0.0,
+                "duration": duration,
+                "strict_duration": True,
+            },
+            "class_type": "Video Slice",
+            "_meta": {
+                "title": "LLM Party exact video duration",
+            },
+        }
+        node["inputs"]["video"] = [trim_node_id, 0]
+        trim_node_ids.append(trim_node_id)
+        applied.extend(
+            [
+                f"{trim_node_id}.start_time",
+                f"{trim_node_id}.duration",
+                f"{trim_node_id}.strict_duration",
+            ]
+        )
+
+    derived["minimax_h3_exact_duration_seconds"] = duration
+    derived["minimax_h3_trim_node_ids"] = trim_node_ids
+    derived["minimax_h3_trim_output_node_ids"] = output_node_ids
+    derived["minimax_h3_trim_save_node_ids"] = output_node_ids
+    if not trim_node_ids:
+        derived["minimax_h3_trim_missing_reason"] = (
+            "no linked video output node (SaveVideo, VideoTrim, VideoCrop, VideoOutput, or terminal export node)"
+        )
+    return bool(trim_node_ids)
+
+
+def _collect_consumed_node_ids(prompt: Mapping[str, Any]) -> set:
+    consumed_node_ids = set()
+    for _, node in _iter_nodes(prompt):
+        for value in node["inputs"].values():
+            if _is_linked_input(value):
+                consumed_node_ids.add(str(value[0]))
+    return consumed_node_ids
+
+
+def _is_video_output_node(
+    node_id: str,
+    node: Mapping[str, Any],
+    consumed_node_ids: set,
+) -> bool:
+    class_type = str(node.get("class_type") or "")
+    if class_type in _VIDEO_OUTPUT_NODES:
+        return True
+    if class_type in _VIDEO_SLICE_NODES or class_type in _VIDEO_INTERMEDIATE_NODES:
+        return False
+    if str(node_id) in consumed_node_ids:
+        return False
+
+    metadata = node.get("_meta")
+    title = metadata.get("title", "") if isinstance(metadata, Mapping) else ""
+    normalized = re.sub(
+        r"[^a-z0-9]",
+        "",
+        f"{class_type} {title}".lower(),
+    )
+    return any(
+        marker in normalized
+        for marker in ("savevideo", "previewvideo", "videooutput", "exportvideo")
+    )
+
+
+def _next_numeric_node_id(prompt: Mapping[str, Any]) -> int:
+    numeric_ids = []
+    for node_id in prompt:
+        try:
+            numeric_ids.append(int(str(node_id)))
+        except (TypeError, ValueError):
+            continue
+    return max(numeric_ids, default=0) + 1
 
 
 def _find_node_input(

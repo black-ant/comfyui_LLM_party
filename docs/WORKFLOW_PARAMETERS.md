@@ -64,3 +64,11 @@ length = round(duration * fps) + 1
 ```
 
 `fps` 优先使用请求参数；请求未传入时，读取预置 `CreateVideo.fps`。
+
+对于 MiniMax H3 工作流，`duration` 会转换为固定 24fps 下符合模型 `17k+5` 帧网格的 `length`。例如 `duration=4` 会先使用 107 帧完成模型生成，原始时长约为 4.46 秒；Party 随后会在 `SaveVideo`、`VideoTrim`、`VideoCrop` 或末端视频导出节点前自动插入 ComfyUI 核心的 `Video Slice`，将最终视频裁剪为请求的 4.00 秒。运行环境需要包含该核心节点及其视频依赖。
+
+H3 的 `length` 即使已经连接到工作流中的时长/数学节点，也会被请求参数覆盖，避免旧版工作流中固定的 5 秒默认值绕过 API 参数。
+
+如果 H3 工作流没有可识别的末端视频输出节点，或其 `video` 输入不是连线，Party 会在 `workflow_parameters_applied` 日志的 `derived.minimax_h3_trim_missing_reason` 中明确记录，不能据此声称最终输出已经严格裁剪。
+
+运行时可通过环境变量调整诊断行为：`COMFYUI_WORKFLOW_TIMEOUT_SEC` 控制整个工作流等待上限（默认 3600 秒），`COMFYUI_HTTP_TIMEOUT_SEC` 控制 ComfyUI 的单次 HTTP 请求超时（默认 30 秒），`COMFYUI_HISTORY_POLL_INTERVAL_SEC` 控制 history 轮询间隔（默认 0.25 秒）。`history_output_summary.assets` 会记录已拉回视频的实际 `video_duration_seconds`、`video_frame_count` 和 `video_fps`；如果探测失败，会记录 `video_probe_error`。部署时建议同时设置 `FASTAPI_BUILD_TAG` 和 `FASTAPI_BUILD_COMMIT`，启动及每次请求日志会带上实际部署版本。

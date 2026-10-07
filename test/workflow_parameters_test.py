@@ -4,6 +4,168 @@ from workflow_parameters import apply_workflow_parameters
 
 
 class WorkflowParametersTest(unittest.TestCase):
+    def test_minimax_h3_duration_converts_to_17k_plus_5_frame_length(self):
+        prompt = {
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {"length": 124},
+            },
+            "82": {
+                "class_type": "EmptyMiniMaxH3LatentAV",
+                "inputs": {"length": 124},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"duration": 4})
+
+        self.assertEqual(prompt["81"]["inputs"]["length"], 107)
+        self.assertEqual(prompt["82"]["inputs"]["length"], 107)
+        self.assertEqual(report["derived"]["minimax_h3_length"], 107)
+        self.assertEqual(report["derived"]["minimax_h3_fps"], 24)
+        self.assertEqual(report["derived"]["minimax_h3_duration_seconds"], 4.458)
+        self.assertEqual(report["ignored"], [])
+
+    def test_minimax_h3_duration_overrides_linked_length_inputs(self):
+        prompt = {
+            "97": {
+                "class_type": "start_workflow",
+                "inputs": {"duration": 5},
+            },
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {"length": ["97", 16]},
+            },
+            "82": {
+                "class_type": "EmptyMiniMaxH3LatentAV",
+                "inputs": {"length": ["97", 16]},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"duration": 4})
+
+        self.assertEqual(prompt["81"]["inputs"]["length"], 107)
+        self.assertEqual(prompt["82"]["inputs"]["length"], 107)
+        self.assertEqual(report["applied"], ["81.length", "82.length", "97.duration"])
+        self.assertEqual(report["ignored"], [])
+
+    def test_minimax_h3_duration_keeps_existing_frame_grid_boundary(self):
+        prompt = {
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {"length": 124},
+            },
+        }
+
+        apply_workflow_parameters(prompt, {"duration": 107 / 24 + 0.01})
+
+        self.assertEqual(prompt["81"]["inputs"]["length"], 107)
+
+    def test_minimax_h3_duration_matches_versioned_node_class(self):
+        prompt = {
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideoV2",
+                "inputs": {"length": 124},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"duration": 4})
+
+        self.assertEqual(prompt["81"]["inputs"]["length"], 107)
+        self.assertEqual(report["derived"]["minimax_h3_length"], 107)
+
+    def test_minimax_h3_duration_inserts_exact_trim_before_save_video(self):
+        prompt = {
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {"length": 124},
+            },
+            "86": {
+                "class_type": "CreateVideo",
+                "inputs": {"fps": 24, "images": ["85", 0]},
+            },
+            "111": {
+                "class_type": "SaveVideo",
+                "inputs": {"video": ["86", 0], "filename_prefix": "video/ComfyUI"},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"duration": 4})
+
+        trim_node_id = report["derived"]["minimax_h3_trim_node_ids"][0]
+        self.assertEqual(prompt["111"]["inputs"]["video"], [trim_node_id, 0])
+        self.assertEqual(prompt[trim_node_id]["class_type"], "Video Slice")
+        self.assertEqual(prompt[trim_node_id]["inputs"]["video"], ["86", 0])
+        self.assertEqual(prompt[trim_node_id]["inputs"]["duration"], 4.0)
+        self.assertTrue(prompt[trim_node_id]["inputs"]["strict_duration"])
+        self.assertEqual(report["derived"]["minimax_h3_exact_duration_seconds"], 4.0)
+        self.assertNotIn("minimax_h3_trim_missing_reason", report["derived"])
+
+    def test_minimax_h3_duration_updates_existing_trim_node(self):
+        prompt = {
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {"length": 124},
+            },
+            "110": {
+                "class_type": "Video Slice",
+                "inputs": {
+                    "video": ["86", 0],
+                    "start_time": 1.0,
+                    "duration": 2.0,
+                    "strict_duration": False,
+                },
+            },
+            "111": {
+                "class_type": "SaveVideo",
+                "inputs": {"video": ["110", 0]},
+            },
+        }
+
+        apply_workflow_parameters(prompt, {"duration": 4})
+
+        self.assertEqual(prompt["110"]["inputs"]["start_time"], 0.0)
+        self.assertEqual(prompt["110"]["inputs"]["duration"], 4.0)
+        self.assertTrue(prompt["110"]["inputs"]["strict_duration"])
+
+    def test_minimax_h3_duration_reports_missing_exact_trim_target(self):
+        prompt = {
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {"length": 124},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"duration": 4})
+
+        self.assertEqual(
+            report["derived"]["minimax_h3_trim_missing_reason"],
+            "no linked video output node (SaveVideo, VideoTrim, VideoCrop, VideoOutput, or terminal export node)",
+        )
+
+    def test_minimax_h3_duration_trims_terminal_video_output_without_save_video(self):
+        prompt = {
+            "81": {
+                "class_type": "MiniMaxH3ImageToVideo",
+                "inputs": {"length": 124},
+            },
+            "86": {
+                "class_type": "CreateVideo",
+                "inputs": {"images": ["84", 0], "audio": ["85", 0]},
+            },
+            "90": {
+                "class_type": "CustomVideoOutput",
+                "inputs": {"video": ["86", 0]},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"duration": 4})
+
+        trim_node_id = report["derived"]["minimax_h3_trim_node_ids"][0]
+        self.assertEqual(prompt["90"]["inputs"]["video"], [trim_node_id, 0])
+        self.assertEqual(prompt[trim_node_id]["class_type"], "Video Slice")
+        self.assertEqual(report["derived"]["minimax_h3_trim_output_node_ids"], ["90"])
+        self.assertNotIn("minimax_h3_trim_missing_reason", report["derived"])
+
     def test_wan_preset_converts_duration_to_length_using_preset_fps(self):
         prompt = {
             '81': {

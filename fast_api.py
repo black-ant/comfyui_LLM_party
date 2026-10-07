@@ -6,6 +6,8 @@ import mimetypes
 import os
 import re
 import time
+import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -77,8 +79,8 @@ if parse_bool(args.object_storage_enabled, default=False):
 fastapi_api_key = config.get("API_KEYS", "fastapi_api_key", fallback="")
 server_address = "127.0.0.1:8188"
 client_id = str(uuid.uuid4())
-FASTAPI_BUILD_TAG = "tensor-json-fix-2026-02-28-v2"
-FASTAPI_BUILD_COMMIT = "c3a2c91"
+FASTAPI_BUILD_TAG = os.getenv("FASTAPI_BUILD_TAG", "unversioned").strip() or "unversioned"
+FASTAPI_BUILD_COMMIT = os.getenv("FASTAPI_BUILD_COMMIT", "unknown").strip() or "unknown"
 
 
 def _get_stream_heartbeat_seconds():
@@ -88,6 +90,33 @@ def _get_stream_heartbeat_seconds():
     except ValueError:
         heartbeat_seconds = 10.0
     return max(1.0, heartbeat_seconds)
+
+
+def _get_workflow_poll_timeout_seconds():
+    raw_value = os.getenv("COMFYUI_WORKFLOW_TIMEOUT_SEC", "3600").strip()
+    try:
+        timeout_seconds = int(raw_value)
+    except ValueError:
+        timeout_seconds = 3600
+    return max(30, min(timeout_seconds, 86400))
+
+
+def _get_workflow_poll_interval_seconds():
+    raw_value = os.getenv("COMFYUI_HISTORY_POLL_INTERVAL_SEC", "0.25").strip()
+    try:
+        poll_interval = float(raw_value)
+    except ValueError:
+        poll_interval = 0.25
+    return max(0.1, min(poll_interval, 5.0))
+
+
+def _get_comfyui_http_timeout_seconds():
+    raw_value = os.getenv("COMFYUI_HTTP_TIMEOUT_SEC", "30").strip()
+    try:
+        timeout_seconds = float(raw_value)
+    except ValueError:
+        timeout_seconds = 30.0
+    return max(1.0, min(timeout_seconds, 300.0))
 
 
 STREAM_HEARTBEAT_SECONDS = _get_stream_heartbeat_seconds()
@@ -190,6 +219,80 @@ def _is_json_serializable(value):
 
 def _log_request(stage: str, request_id: str, payload):
     print(f"[FASTAPI][{request_id}][{stage}] {_json_dumps_for_log(_redact_log_value(payload))}")
+
+
+def _exception_log_payload(exc: Exception):
+    payload = _exception_summary_payload(exc)
+    payload["traceback_tail"] = traceback.format_exc().splitlines()[-20:]
+    return payload
+
+
+def _exception_summary_payload(exc: Exception):
+    payload = {
+        "error_type": type(exc).__name__,
+        "error": str(exc),
+    }
+    detail = getattr(exc, "detail", None)
+    if detail is not None:
+        payload["detail"] = detail
+        payload["error"] = detail if isinstance(detail, str) else _json_dumps_for_log(detail)
+    if isinstance(exc, urllib.error.HTTPError):
+        payload["status_code"] = exc.code
+        try:
+            response_body = exc.read(8192)
+        except Exception as read_error:
+            payload["response_read_error"] = str(read_error)
+        else:
+            if response_body:
+                payload["response_body"] = _safe_preview(
+                    response_body.decode("utf-8", errors="replace"),
+                    4096,
+                )
+    return payload
+
+
+class ComfyUIWorkflowError(RuntimeError):
+    pass
+
+
+def _history_error_details(history_entry):
+    if not isinstance(history_entry, dict):
+        return None
+
+    status = history_entry.get("status")
+    if not isinstance(status, dict):
+        return None
+
+    status_text = str(status.get("status_str", "")).strip().lower()
+    messages = status.get("messages")
+    details = []
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, (list, tuple)) or not message:
+                continue
+            message_type = str(message[0]).strip()
+            if message_type not in {"execution_error", "execution_interrupted"}:
+                continue
+            payload = message[1] if len(message) > 1 else None
+            details.append({"type": message_type, "detail": payload})
+
+    if status_text not in {"error", "failed", "failure", "interrupted"} and not details:
+        return None
+    return {
+        "status": status_text or "unknown",
+        "completed": bool(status.get("completed", False)),
+        "details": details[-10:],
+    }
+
+
+def _raise_history_error(history_entry, request_id="", prompt_id=""):
+    details = _history_error_details(history_entry)
+    if not details:
+        return
+    if prompt_id:
+        details["prompt_id"] = prompt_id
+    _log_request("workflow_execution_error", request_id, details)
+    raise ComfyUIWorkflowError("ComfyUI workflow failed: " + _safe_preview(_json_dumps_for_log(details), 4096))
 
 
 def _safe_preview(value: str, max_len: int = 160):
@@ -503,17 +606,64 @@ def build_local_filename(counter: int, filename_hint: str, content_type: str, me
     return f"{timestamp}_{counter}{ext}"
 
 
-def queue_prompt(prompt, workflow_client_id: Optional[str] = None):
+def _probe_video_asset(file_bytes: bytes):
+    if not file_bytes:
+        return {}
+
+    try:
+        import av
+
+        with av.open(BytesIO(file_bytes), mode="r") as container:
+            video_stream = next(
+                (stream for stream in container.streams if stream.type == "video"),
+                None,
+            )
+            if video_stream is None:
+                return {"video_probe_error": "no video stream"}
+
+            metadata = {
+                "video_duration_seconds": None,
+                "video_frame_count": int(video_stream.frames or 0),
+                "video_fps": None,
+            }
+            if container.duration is not None:
+                metadata["video_duration_seconds"] = round(
+                    float(container.duration / av.time_base),
+                    6,
+                )
+            if video_stream.average_rate:
+                metadata["video_fps"] = round(float(video_stream.average_rate), 6)
+            if metadata["video_frame_count"] <= 0:
+                metadata["video_frame_count"] = sum(
+                    1 for _ in container.decode(video_stream)
+                )
+            if metadata["video_duration_seconds"] is None and metadata["video_fps"]:
+                metadata["video_duration_seconds"] = round(
+                    metadata["video_frame_count"] / metadata["video_fps"],
+                    6,
+                )
+            return metadata
+    except Exception as probe_error:
+        return {
+            "video_probe_error": f"{type(probe_error).__name__}: {probe_error}",
+        }
+
+
+def queue_prompt(prompt, workflow_client_id: Optional[str] = None, timeout: Optional[float] = None):
     p = {"prompt": prompt, "client_id": workflow_client_id or client_id}
     data = json.dumps(p).encode("utf-8")
     req = urllib.request.Request("http://{}/prompt".format(server_address), data=data)
-    return json.loads(urllib.request.urlopen(req).read())
+    with urllib.request.urlopen(req, timeout=timeout or _get_comfyui_http_timeout_seconds()) as response:
+        return json.loads(response.read())
 
 
-def get_asset_bytes(filename, subfolder, folder_type):
+def get_asset_bytes(filename, subfolder, folder_type, timeout: Optional[float] = None):
     data = {"filename": filename, "subfolder": subfolder, "type": folder_type}
     url_values = urllib.parse.urlencode(data)
-    with urllib.request.urlopen("http://{}/view?{}".format(server_address, url_values)) as response:
+    with urllib.request.urlopen(
+        "http://{}/view?{}".format(server_address, url_values),
+        timeout=timeout or _get_comfyui_http_timeout_seconds(),
+    ) as response:
         return response.read()
 
 
@@ -521,8 +671,11 @@ def get_image(filename, subfolder, folder_type):
     return get_asset_bytes(filename, subfolder, folder_type)
 
 
-def get_history(prompt_id):
-    with urllib.request.urlopen("http://{}/history/{}".format(server_address, prompt_id)) as response:
+def get_history(prompt_id, timeout: Optional[float] = None):
+    with urllib.request.urlopen(
+        "http://{}/history/{}".format(server_address, prompt_id),
+        timeout=timeout or _get_comfyui_http_timeout_seconds(),
+    ) as response:
         return json.loads(response.read())
 
 
@@ -691,6 +844,11 @@ def _consume_comfyui_progress_message(
 def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = None):
     workflow_client_id = str(uuid.uuid4())
     progress_socket = None
+    poll_started_at = time.monotonic()
+    poll_timeout_seconds = _get_workflow_poll_timeout_seconds()
+    poll_interval_seconds = _get_workflow_poll_interval_seconds()
+    http_timeout_seconds = _get_comfyui_http_timeout_seconds()
+    poll_failures = 0
     try:
         progress_socket = websocket.create_connection(
             "ws://{}/ws?clientId={}".format(server_address, workflow_client_id),
@@ -702,7 +860,19 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
         progress_socket = None
 
     try:
-        prompt_id = queue_prompt(prompt, workflow_client_id)["prompt_id"]
+        prompt_id = queue_prompt(
+            prompt,
+            workflow_client_id,
+            timeout=http_timeout_seconds,
+        )["prompt_id"]
+        _log_request(
+            "workflow_prompt_queued",
+            request_id,
+            {
+                "prompt_id": prompt_id,
+                "node_count": len(prompt) if isinstance(prompt, dict) else None,
+            },
+        )
     except Exception:
         if progress_socket is not None:
             progress_socket.close()
@@ -720,6 +890,12 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
     output_images = {}
     output_media = {}
     output_text = ""
+    expected_asset_count = 0
+    expected_video_assets = 0
+    fetched_asset_count = 0
+    fetched_video_assets = 0
+    asset_fetch_failures = []
+    asset_summaries = []
 
     try:
         while True:
@@ -745,7 +921,8 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
                     progress_socket = None
 
             try:
-                history = get_history(prompt_id)[prompt_id]
+                history = get_history(prompt_id, timeout=http_timeout_seconds)[prompt_id]
+                _raise_history_error(history, request_id, prompt_id)
                 _emit_comfyui_progress(
                     progress_state,
                     prompt_id,
@@ -754,8 +931,41 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
                     force=True,
                 )
                 break
-            except Exception:
-                time.sleep(0.1)
+            except ComfyUIWorkflowError:
+                raise
+            except Exception as history_error:
+                poll_failures += 1
+                elapsed_ms = int((time.monotonic() - poll_started_at) * 1000)
+                if poll_failures == 1 or poll_failures % 50 == 0:
+                    history_error_payload = _exception_summary_payload(history_error)
+                    history_error_payload.update(
+                        {
+                            "attempt": poll_failures,
+                            "elapsed_ms": elapsed_ms,
+                        }
+                    )
+                    _log_request(
+                        "history_poll_error",
+                        request_id,
+                        history_error_payload,
+                    )
+                if time.monotonic() - poll_started_at >= poll_timeout_seconds:
+                    timeout_error = TimeoutError(
+                        f"ComfyUI workflow history timeout after {poll_timeout_seconds}s "
+                        f"(prompt_id={prompt_id}, last_error={history_error})"
+                    )
+                    _log_request(
+                        "workflow_timeout",
+                        request_id,
+                        {
+                            "prompt_id": prompt_id,
+                            "timeout_seconds": poll_timeout_seconds,
+                            "attempt": poll_failures,
+                            "last_error": str(history_error),
+                        },
+                    )
+                    raise timeout_error
+                time.sleep(poll_interval_seconds)
                 continue
     finally:
         if progress_socket is not None:
@@ -788,16 +998,47 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
                     continue
                 seen_assets.add(asset_key)
 
-                try:
-                    asset_data = get_asset_bytes(filename, subfolder, folder_type)
-                except Exception as image_err:
-                    print(f"Failed to fetch image/media from history: {filename}, err={image_err}")
-                    continue
-
                 media_kind, content_type = infer_media_kind(
                     filename=filename,
                     format_hint=image.get("format", ""),
                     default_kind="image",
+                )
+                expected_asset_count += 1
+                if media_kind == "video":
+                    expected_video_assets += 1
+
+                try:
+                    asset_data = get_asset_bytes(
+                        filename,
+                        subfolder,
+                        folder_type,
+                        timeout=http_timeout_seconds,
+                    )
+                except Exception as image_err:
+                    failure = {
+                        "node_id": node_id,
+                        "filename": filename,
+                        "subfolder": subfolder,
+                        "folder_type": folder_type,
+                        "media_kind": media_kind,
+                    }
+                    failure.update(_exception_summary_payload(image_err))
+                    asset_fetch_failures.append(failure)
+                    _log_request("history_asset_fetch_error", request_id, failure)
+                    continue
+
+                fetched_asset_count += 1
+                if media_kind == "video":
+                    fetched_video_assets += 1
+                asset_summaries.append(
+                    {
+                        "node_id": node_id,
+                        "filename": filename,
+                        "media_kind": media_kind,
+                        "content_type": content_type,
+                        "size_bytes": len(asset_data),
+                        **(_probe_video_asset(asset_data) if media_kind == "video" else {}),
+                    }
                 )
                 if media_kind == "video":
                     media_entries.append(
@@ -829,16 +1070,46 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
                 if asset_key in seen_assets:
                     continue
                 seen_assets.add(asset_key)
-                try:
-                    media_data = get_asset_bytes(filename, subfolder, folder_type)
-                except Exception as media_err:
-                    print(f"Failed to fetch media from history: {filename}, err={media_err}")
-                    continue
-
                 media_kind, content_type = infer_media_kind(
                     filename=filename,
                     format_hint=media_item.get("format", ""),
                     default_kind="video",
+                )
+                expected_asset_count += 1
+                if media_kind == "video":
+                    expected_video_assets += 1
+                try:
+                    media_data = get_asset_bytes(
+                        filename,
+                        subfolder,
+                        folder_type,
+                        timeout=http_timeout_seconds,
+                    )
+                except Exception as media_err:
+                    failure = {
+                        "node_id": node_id,
+                        "filename": filename,
+                        "subfolder": subfolder,
+                        "folder_type": folder_type,
+                        "media_kind": media_kind,
+                    }
+                    failure.update(_exception_summary_payload(media_err))
+                    asset_fetch_failures.append(failure)
+                    _log_request("history_asset_fetch_error", request_id, failure)
+                    continue
+
+                fetched_asset_count += 1
+                if media_kind == "video":
+                    fetched_video_assets += 1
+                asset_summaries.append(
+                    {
+                        "node_id": node_id,
+                        "filename": filename,
+                        "media_kind": media_kind,
+                        "content_type": content_type,
+                        "size_bytes": len(media_data),
+                        **(_probe_video_asset(media_data) if media_kind == "video" else {}),
+                    }
                 )
                 media_entries.append(
                     {
@@ -867,10 +1138,58 @@ def get_all(prompt, request_id: str = "", progress_callback: ProgressCallback = 
         request_id,
         {
             "prompt_id": prompt_id,
+            "history_status": history.get("status") if isinstance(history, dict) else None,
             "image_nodes": list(output_images.keys()),
             "media_nodes": list(output_media.keys()),
+            "expected_asset_count": expected_asset_count,
+            "expected_video_assets": expected_video_assets,
+            "fetched_asset_count": fetched_asset_count,
+            "fetched_video_assets": fetched_video_assets,
+            "assets": asset_summaries,
+            "asset_fetch_failures": asset_fetch_failures,
         },
     )
+
+    if expected_video_assets > 0 and fetched_video_assets == 0:
+        failure_payload = {
+            "prompt_id": prompt_id,
+            "reason": "video_assets_unavailable",
+            "expected_video_assets": expected_video_assets,
+            "fetched_video_assets": fetched_video_assets,
+            "failures": asset_fetch_failures,
+        }
+        _log_request("workflow_output_failed", request_id, failure_payload)
+        raise ComfyUIWorkflowError(
+            "ComfyUI workflow completed but video outputs could not be fetched: "
+            + _safe_preview(_json_dumps_for_log(failure_payload), 4096)
+        )
+
+    if expected_asset_count > 0 and fetched_asset_count == 0:
+        failure_payload = {
+            "prompt_id": prompt_id,
+            "reason": "all_output_assets_unavailable",
+            "expected_asset_count": expected_asset_count,
+            "fetched_asset_count": fetched_asset_count,
+            "failures": asset_fetch_failures,
+        }
+        _log_request("workflow_output_failed", request_id, failure_payload)
+        raise ComfyUIWorkflowError(
+            "ComfyUI workflow completed but output assets could not be fetched: "
+            + _safe_preview(_json_dumps_for_log(failure_payload), 4096)
+        )
+
+    if not output_images and not output_media and not str(output_text or "").strip():
+        failure_payload = {
+            "prompt_id": prompt_id,
+            "reason": "no_usable_outputs",
+            "history_status": history.get("status") if isinstance(history, dict) else None,
+        }
+        _log_request("workflow_output_failed", request_id, failure_payload)
+        raise ComfyUIWorkflowError(
+            "ComfyUI workflow completed without usable outputs: "
+            + _safe_preview(_json_dumps_for_log(failure_payload), 4096)
+        )
+
     return output_images, output_media, output_text
 
 
@@ -927,6 +1246,7 @@ def api(
     workflow_params=None,
 ):
     global current_dir_path
+    workflow_params = workflow_params or {}
     workflow_path = workflow_path
     WF_path = os.path.join(current_dir_path, "workflow_api", workflow_path)
     _log_request(
@@ -975,7 +1295,14 @@ def api(
 
     parameter_report = apply_workflow_parameters(prompt, workflow_params, workflow_config)
     if parameter_report["requested"]:
-        _log_request("workflow_parameters_applied", request_id, parameter_report)
+        _log_request(
+            "workflow_parameters_applied",
+            request_id,
+            {
+                "values": normalize_workflow_parameters(workflow_params),
+                "report": parameter_report,
+            },
+        )
 
     validate_api_workflow(prompt, workflow_path)
 
@@ -1027,10 +1354,42 @@ def api(
                 },
             )
 
-    images, media, res = get_all(
-        prompt,
-        request_id=request_id,
-        progress_callback=progress_callback,
+    workflow_started_at = time.monotonic()
+    _log_request(
+        "workflow_execution_started",
+        request_id,
+        {
+            "workflow_path": workflow_path,
+            "duration": workflow_params.get("duration"),
+            "fps": workflow_params.get("fps"),
+            "resolution": workflow_params.get("resolution"),
+            "aspect_ratio": workflow_params.get("aspect_ratio"),
+            "workflow_timeout_seconds": _get_workflow_poll_timeout_seconds(),
+            "history_poll_interval_seconds": _get_workflow_poll_interval_seconds(),
+            "comfyui_http_timeout_seconds": _get_comfyui_http_timeout_seconds(),
+        },
+    )
+    try:
+        images, media, res = get_all(
+            prompt,
+            request_id=request_id,
+            progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        failure_payload = _exception_log_payload(exc)
+        failure_payload["workflow_path"] = workflow_path
+        failure_payload["elapsed_ms"] = int((time.monotonic() - workflow_started_at) * 1000)
+        _log_request("workflow_execution_failed", request_id, failure_payload)
+        raise
+    _log_request(
+        "workflow_execution_completed",
+        request_id,
+        {
+            "workflow_path": workflow_path,
+            "elapsed_ms": int((time.monotonic() - workflow_started_at) * 1000),
+            "image_nodes": list(images.keys()) if isinstance(images, dict) else images,
+            "media_nodes": list(media.keys()) if isinstance(media, dict) else media,
+        },
     )
     _log_request(
         "api_output",
@@ -1248,12 +1607,26 @@ async def create_completion(request_data: CompletionRequest, request: Request, d
         
         _log_request("completion_response", request_id, response)
         return response
-    except HTTPException:
-        _log_request("http_exception", request_id, {"detail": "HTTPException raised"})
-        raise
+    except HTTPException as exc:
+        _log_request(
+            "http_exception",
+            request_id,
+            {"status_code": exc.status_code, "detail": exc.detail},
+        )
+        response_headers = dict(exc.headers or {})
+        response_headers.setdefault("X-Request-ID", request_id)
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            headers=response_headers,
+        ) from exc
     except Exception as e:
-        _log_request("unhandled_exception", request_id, {"error": str(e)})
-        raise HTTPException(status_code=500, detail=str(e))
+        _log_request("unhandled_exception", request_id, _exception_log_payload(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"{e} [request_id={request_id}]",
+            headers={"X-Request-ID": request_id},
+        ) from e
 
 
 def _extract_content_from_completion(response):
@@ -1325,13 +1698,20 @@ async def stream_completion_with_heartbeat(request_data: CompletionRequest, requ
                 try:
                     response = task.result()
                 except Exception as exc:
-                    _log_request("stream_error", request_id, {"error": str(exc)})
+                    _log_request("stream_error", request_id, _exception_log_payload(exc))
+                    error_message = getattr(exc, "detail", None)
+                    if error_message is None or not str(error_message).strip():
+                        error_message = str(exc)
                     error_payload = {
                         "id": "chatcmpl-" + str(uuid.uuid4()),
                         "object": "error",
                         "created": int(time.time()),
                         "model": request_data.model,
-                        "error": {"message": str(exc)},
+                        "error": {
+                            "message": str(error_message),
+                            "type": type(exc).__name__,
+                            "request_id": request_id,
+                        },
                     }
                     yield f"data: {json.dumps(error_payload, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
