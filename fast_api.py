@@ -335,6 +335,41 @@ def _safe_preview(value: str, max_len: int = 160):
     return raw[:max_len] + "...(truncated)"
 
 
+def _safe_image_url_for_log(value: str):
+    candidate = str(value or "").strip()
+    if not candidate:
+        return ""
+    if candidate.lower().startswith("data:image/"):
+        prefix_end = candidate.lower().find(";base64,")
+        if prefix_end >= 0:
+            return f"{candidate[:prefix_end + len(';base64,')]}<redacted:{len(candidate) - prefix_end - len(';base64,')} chars>"
+        return _safe_preview(candidate)
+
+    try:
+        parsed = urllib.parse.urlsplit(candidate)
+        if parsed.scheme.lower() in {"http", "https"}:
+            query_parts = []
+            for key, query_value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+                normalized_key = key.strip().lower().replace("-", "_")
+                is_sensitive = (
+                    normalized_key in _LOG_SENSITIVE_KEYS
+                    or "token" in normalized_key
+                    or "secret" in normalized_key
+                    or "signature" in normalized_key
+                    or "password" in normalized_key
+                    or "credential" in normalized_key
+                )
+                query_parts.append((key, "<redacted>" if is_sensitive else query_value))
+            safe_query = urllib.parse.urlencode(query_parts)
+            safe_url = urllib.parse.urlunsplit(
+                (parsed.scheme, parsed.netloc, parsed.path, safe_query, "")
+            )
+            return _safe_preview(safe_url, 512)
+    except Exception:
+        pass
+    return _safe_preview(candidate, 512)
+
+
 def _log_prompt_texts(
     request_id: str,
     workflow_path: str,
@@ -1891,20 +1926,56 @@ async def process_request(
                             # parsed_url = urllib.parse.urlparse(content["image_url"])
                             # if parsed_url.netloc not in allowed_domains:
                             #     raise HTTPException(status_code=400, detail="Image URL domain is not allowed.")
-                            async with httpx.AsyncClient() as client:
-                                response = await client.get(image_url)
-                                if response.status_code == 200:
-                                    raw_images_bytes.append(response.content)
-                                    parsed = urllib.parse.urlparse(image_url)
-                                    image_sources.append(
-                                        {
-                                            "source_type": "remote_url",
-                                            "url_host": parsed.netloc,
-                                            "url_path": _safe_preview(parsed.path),
-                                        }
-                                    )
-                                else:
-                                    raise HTTPException(status_code=400, detail="Image could not be retrieved.")
+                            fetch_url = _safe_image_url_for_log(image_url)
+                            _log_request(
+                                "image_fetch_start",
+                                request_id,
+                                {"fetch_url": fetch_url},
+                            )
+                            try:
+                                async with httpx.AsyncClient(
+                                    follow_redirects=True,
+                                    timeout=_get_comfyui_http_timeout_seconds(),
+                                ) as client:
+                                    response = await client.get(image_url)
+                            except Exception as fetch_error:
+                                _log_request(
+                                    "image_fetch_error",
+                                    request_id,
+                                    {
+                                        "fetch_url": fetch_url,
+                                        "error_type": type(fetch_error).__name__,
+                                        "error": _safe_preview(str(fetch_error), 512),
+                                    },
+                                )
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail="Image could not be retrieved.",
+                                ) from fetch_error
+
+                            _log_request(
+                                "image_fetch_response",
+                                request_id,
+                                {
+                                    "fetch_url": fetch_url,
+                                    "final_url": _safe_image_url_for_log(str(response.url)),
+                                    "status_code": response.status_code,
+                                    "content_type": response.headers.get("content-type", ""),
+                                    "content_length": len(response.content),
+                                },
+                            )
+                            if response.status_code == 200:
+                                raw_images_bytes.append(response.content)
+                                parsed = urllib.parse.urlparse(image_url)
+                                image_sources.append(
+                                    {
+                                        "source_type": "remote_url",
+                                        "url_host": parsed.netloc,
+                                        "url_path": _safe_preview(parsed.path),
+                                    }
+                                )
+                            else:
+                                raise HTTPException(status_code=400, detail="Image could not be retrieved.")
                     else:
                         raise HTTPException(
                             status_code=400,
