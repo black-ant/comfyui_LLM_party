@@ -370,6 +370,18 @@ def _safe_image_url_for_log(value: str):
     return _safe_preview(candidate, 512)
 
 
+def _image_fetch_failure_detail(response):
+    status_code = getattr(response, "status_code", 0)
+    response_text = str(getattr(response, "text", "") or "").lower()
+    if status_code == 403:
+        if "expired" in response_text or "request has expired" in response_text:
+            return "Image could not be retrieved: image URL has expired (HTTP 403)."
+        return "Image could not be retrieved: image URL was rejected (HTTP 403)."
+    if status_code:
+        return f"Image could not be retrieved: upstream returned HTTP {status_code}."
+    return "Image could not be retrieved."
+
+
 def _log_prompt_texts(
     request_id: str,
     workflow_path: str,
@@ -1366,6 +1378,9 @@ def api(
             "model_name": model_name,
             "user_history": user_history,
             "image_input_count": len(image_input) if isinstance(image_input, list) else 0,
+            "workflow_params": workflow_params,
+            "normalized_workflow_params": normalize_workflow_parameters(workflow_params),
+            "duration": workflow_params.get("duration"),
         },
     )
     _log_prompt_texts(
@@ -1393,14 +1408,28 @@ def api(
         if isinstance(raw_workflow_config, dict):
             workflow_config = raw_workflow_config
 
+    normalized_workflow_params = normalize_workflow_parameters(workflow_params)
+    _log_request(
+        "workflow_parameters_before_apply",
+        request_id,
+        {
+            "workflow_path": workflow_path,
+            "raw_workflow_params": workflow_params,
+            "normalized_workflow_params": normalized_workflow_params,
+            "duration": normalized_workflow_params.get("duration"),
+            "workflow_snapshot": _workflow_parameter_snapshot(prompt),
+        },
+    )
     parameter_report = apply_workflow_parameters(prompt, workflow_params, workflow_config)
     if parameter_report["requested"]:
         _log_request(
             "workflow_parameters_applied",
             request_id,
             {
-                "values": normalize_workflow_parameters(workflow_params),
+                "values": normalized_workflow_params,
                 "report": parameter_report,
+                "duration": normalized_workflow_params.get("duration"),
+                "workflow_snapshot": _workflow_parameter_snapshot(prompt),
             },
         )
 
@@ -1464,6 +1493,8 @@ def api(
             "fps": workflow_params.get("fps"),
             "resolution": workflow_params.get("resolution"),
             "aspect_ratio": workflow_params.get("aspect_ratio"),
+            "normalized_workflow_params": normalize_workflow_parameters(workflow_params),
+            "workflow_snapshot": _workflow_parameter_snapshot(prompt),
             "workflow_timeout_seconds": _get_workflow_poll_timeout_seconds(),
             "history_poll_interval_seconds": _get_workflow_poll_interval_seconds(),
             "comfyui_http_timeout_seconds": _get_comfyui_http_timeout_seconds(),
@@ -1570,6 +1601,97 @@ def _build_workflow_params(request_data: CompletionRequest) -> Dict[str, Any]:
         if value is not None:
             params[key] = value
     return params
+
+
+def _value_type_for_log(value):
+    if value is None:
+        return "null"
+    return type(value).__name__
+
+
+def _completion_request_parameters_for_log(request_data: CompletionRequest) -> Dict[str, Any]:
+    request_dict = _model_to_dict(request_data)
+    normalized_params = _build_workflow_params(request_data)
+    video_config = request_data.video_config or {}
+    params = request_data.params or {}
+    workflow_params = request_data.workflow_params or {}
+    return {
+        "request_data": request_dict,
+        "parameter_sources": {
+            "top_level": {
+                "model": request_data.model,
+                "max_tokens": request_data.max_tokens,
+                "stream": request_data.stream,
+                "storage_profile": request_data.storage_profile,
+                "duration": request_data.duration,
+                "size": request_data.size,
+                "resolution": request_data.resolution,
+                "fps": request_data.fps,
+                "aspect_ratio": request_data.aspect_ratio,
+                "ratio": request_data.ratio,
+                "width": request_data.width,
+                "height": request_data.height,
+            },
+            "video_config": video_config,
+            "params": params,
+            "workflow_params": workflow_params,
+        },
+        "normalized_workflow_params": normalized_params,
+        "duration_trace": {
+            "top_level": request_data.duration,
+            "top_level_type": _value_type_for_log(request_data.duration),
+            "video_config": video_config.get("duration"),
+            "video_config_type": _value_type_for_log(video_config.get("duration")),
+            "params": params.get("duration"),
+            "params_type": _value_type_for_log(params.get("duration")),
+            "workflow_params": workflow_params.get("duration"),
+            "workflow_params_type": _value_type_for_log(workflow_params.get("duration")),
+            "effective": normalized_params.get("duration"),
+            "effective_type": _value_type_for_log(normalized_params.get("duration")),
+        },
+    }
+
+
+def _workflow_parameter_snapshot(prompt: Dict[str, Any]) -> Dict[str, Any]:
+    snapshot = {}
+    if not isinstance(prompt, dict):
+        return snapshot
+    interesting_inputs = {
+        "duration",
+        "length",
+        "fps",
+        "start_time",
+        "strict_duration",
+        "video",
+    }
+    interesting_classes = {
+        "MiniMaxH3ImageToVideo",
+        "MiniMaxH3ReferenceToVideo",
+        "EmptyMiniMaxH3LatentAV",
+        "CreateVideo",
+        "SaveVideo",
+        "Video Slice",
+        "VideoSlice",
+    }
+    for node_id, node in prompt.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        class_type = str(node.get("class_type") or "")
+        selected_inputs = {
+            key: inputs[key]
+            for key in interesting_inputs
+            if key in inputs
+        }
+        if not selected_inputs and class_type not in interesting_classes:
+            continue
+        snapshot[str(node_id)] = {
+            "class_type": class_type,
+            "inputs": selected_inputs,
+        }
+    return snapshot
 
 
 VALID_API_KEY = fastapi_api_key
@@ -1705,6 +1827,11 @@ def _completion_error_payload(exc: Exception, request_id: str, model_name: str =
 @app.post("/v1/chat/completions")
 async def create_completion(request_data: CompletionRequest, request: Request, dependency=Depends(verify_api_key)):
     request_id = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    _log_request(
+        "request_parameters",
+        request_id,
+        _completion_request_parameters_for_log(request_data),
+    )
     _log_request(
         "incoming",
         request_id,
@@ -1867,6 +1994,17 @@ async def process_request(
     if not request_data.messages:
         raise HTTPException(status_code=400, detail="messages is required")
 
+    effective_workflow_params = _build_workflow_params(request_data)
+    _log_request(
+        "effective_workflow_params",
+        request_id,
+        {
+            "model": model_name,
+            "workflow_params": effective_workflow_params,
+            "duration": effective_workflow_params.get("duration"),
+            "duration_type": _value_type_for_log(effective_workflow_params.get("duration")),
+        },
+    )
     _log_request("model_name", request_id, {"model_name": model_name})
     raw_images_bytes = []
     image_sources = []
@@ -1953,17 +2091,16 @@ async def process_request(
                                     detail="Image could not be retrieved.",
                                 ) from fetch_error
 
-                            _log_request(
-                                "image_fetch_response",
-                                request_id,
-                                {
-                                    "fetch_url": fetch_url,
-                                    "final_url": _safe_image_url_for_log(str(response.url)),
-                                    "status_code": response.status_code,
-                                    "content_type": response.headers.get("content-type", ""),
-                                    "content_length": len(response.content),
-                                },
-                            )
+                            image_fetch_response = {
+                                "fetch_url": fetch_url,
+                                "final_url": _safe_image_url_for_log(str(response.url)),
+                                "status_code": response.status_code,
+                                "content_type": response.headers.get("content-type", ""),
+                                "content_length": len(response.content),
+                            }
+                            if response.status_code != 200:
+                                image_fetch_response["failure_detail"] = _image_fetch_failure_detail(response)
+                            _log_request("image_fetch_response", request_id, image_fetch_response)
                             if response.status_code == 200:
                                 raw_images_bytes.append(response.content)
                                 parsed = urllib.parse.urlparse(image_url)
@@ -1975,7 +2112,10 @@ async def process_request(
                                     }
                                 )
                             else:
-                                raise HTTPException(status_code=400, detail="Image could not be retrieved.")
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=_image_fetch_failure_detail(response),
+                                )
                     else:
                         raise HTTPException(
                             status_code=400,
@@ -2039,7 +2179,9 @@ async def process_request(
             "image_count": len(image_path_list),
             "img_path1": img_path1,
             "img_path2": img_path2,
-            "workflow_param_keys": sorted(_build_workflow_params(request_data).keys()),
+            "workflow_params": effective_workflow_params,
+            "duration": effective_workflow_params.get("duration"),
+            "workflow_param_keys": sorted(effective_workflow_params.keys()),
         },
     )
     _log_prompt_texts(
@@ -2066,7 +2208,7 @@ async def process_request(
         user_history=user_histories,
         request_id=request_id,
         progress_callback=progress_callback,
-        workflow_params=_build_workflow_params(request_data),
+        workflow_params=effective_workflow_params,
     )
 
     has_images = isinstance(images, dict) and any(images.values())

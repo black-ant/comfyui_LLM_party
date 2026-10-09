@@ -76,6 +76,34 @@ class FastAPIErrorDetailsTest(unittest.TestCase):
 
         self.assertTrue(self.fast_api._is_comfyui_unreachable_error(error))
 
+    def test_expired_remote_image_url_has_actionable_error(self):
+        class Response:
+            status_code = 403
+            text = "<Error><Code>ExpiredToken</Code><Message>Request has expired</Message></Error>"
+
+        detail = self.fast_api._image_fetch_failure_detail(Response())
+
+        self.assertIn("expired", detail)
+        self.assertIn("HTTP 403", detail)
+
+    def test_request_parameter_log_traces_nested_duration_precedence(self):
+        request_data = self.fast_api.CompletionRequest(
+            model="Mimax-H3-202609",
+            messages=[self.fast_api.Message(role="user", content="animate")],
+            video_config={"duration": 5},
+            params={"duration": 4},
+            workflow_params={"duration": 3, "fps": 24},
+        )
+
+        payload = self.fast_api._completion_request_parameters_for_log(request_data)
+
+        self.assertEqual(payload["duration_trace"]["video_config"], 5)
+        self.assertEqual(payload["duration_trace"]["params"], 4)
+        self.assertEqual(payload["duration_trace"]["workflow_params"], 3)
+        self.assertEqual(payload["duration_trace"]["effective"], 3)
+        self.assertEqual(payload["normalized_workflow_params"]["duration"], 3)
+        self.assertEqual(payload["normalized_workflow_params"]["fps"], 24)
+
 
 if __name__ == "__main__":
     unittest.main()
