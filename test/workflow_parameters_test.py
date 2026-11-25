@@ -102,11 +102,11 @@ class WorkflowParametersTest(unittest.TestCase):
             },
             "81": {
                 "class_type": "MiniMaxH3ImageToVideo",
-                "inputs": {"length": ["97", 16]},
+                "inputs": {"length": ["97", 32]},
             },
             "82": {
                 "class_type": "EmptyMiniMaxH3LatentAV",
-                "inputs": {"length": ["97", 16]},
+                "inputs": {"length": ["97", 32]},
             },
         }
 
@@ -572,4 +572,22 @@ class WorkflowParametersTest(unittest.TestCase):
         self.assertEqual(prompt["12"]["inputs"]["duration"], 8)
         self.assertEqual(report["applied"], ["12.duration", "7.megapixels"])
         self.assertEqual(report["ignored"], [])
+
+    def test_steps_parameter_updates_start_workflow_input(self):
+        prompt = {
+            "148": {
+                "class_type": "start_workflow",
+                "inputs": {"duration": 5, "steps": 20},
+            },
+            "124": {
+                "class_type": "BasicScheduler",
+                "inputs": {"steps": ["148", 33]},
+            },
+        }
+
+        report = apply_workflow_parameters(prompt, {"steps": 4})
+
+        self.assertEqual(prompt["148"]["inputs"]["steps"], 4)
+        self.assertEqual(prompt["124"]["inputs"]["steps"], ["148", 33])
+        self.assertIn("148.steps", report["applied"])
 

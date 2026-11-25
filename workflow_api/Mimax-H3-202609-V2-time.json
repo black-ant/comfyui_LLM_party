@@ -32,7 +32,8 @@
       "aspect_ratio": "",
       "size": "",
       "width": 640,
-      "height": 640
+      "height": 640,
+      "steps": 20
     },
     "class_type": "start_workflow",
     "_meta": {
@@ -214,15 +215,15 @@
     "inputs": {
       "prompt": [
         "127",
-        4
+        20
       ],
       "width": [
         "127",
-        14
+        30
       ],
       "height": [
         "127",
-        15
+        31
       ],
       "length": [
         "105:107",
@@ -267,7 +268,7 @@
     "inputs": {
       "value": [
         "127",
-        9
+        25
       ]
     },
     "class_type": "PrimitiveFloat",
@@ -316,8 +317,8 @@
         0
       ],
       "on_false": [
-        "105:124",
-        0
+        "127",
+        33
       ],
       "on_true": [
         "105:125",

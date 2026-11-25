@@ -1659,6 +1659,48 @@ def api(
                 },
             )
 
+    _log_request(
+        "final_comfyui_inputs",
+        request_id,
+        {
+            "workflow_path": workflow_path,
+            "workflow_params": normalized_workflow_params,
+            "workflow_param_keys": sorted(normalized_workflow_params.keys()),
+            "duration": normalized_workflow_params.get("duration"),
+            "fps": normalized_workflow_params.get("fps"),
+            "steps": normalized_workflow_params.get("steps"),
+            "aspect_ratio": normalized_workflow_params.get("aspect_ratio"),
+            "resolution": normalized_workflow_params.get("resolution"),
+            "size": normalized_workflow_params.get("size"),
+            "width": normalized_workflow_params.get("width"),
+            "height": normalized_workflow_params.get("height"),
+            "workflow_snapshot": _workflow_parameter_snapshot(prompt),
+            "build_tag": FASTAPI_BUILD_TAG,
+            "build_commit": FASTAPI_BUILD_COMMIT,
+        },
+    )
+
+    _log_request(
+        "param_effectiveness",
+        request_id,
+        {
+            "workflow_path": workflow_path,
+            "requested_params": normalized_workflow_params,
+            "effectiveness": _param_effectiveness_for_log(
+                prompt,
+                normalized_workflow_params,
+                parameter_report,
+            ),
+            "report": {
+                "applied": parameter_report.get("applied", []),
+                "ignored": parameter_report.get("ignored", []),
+                "derived": parameter_report.get("derived", {}),
+            },
+            "build_tag": FASTAPI_BUILD_TAG,
+            "build_commit": FASTAPI_BUILD_COMMIT,
+        },
+    )
+
     workflow_started_at = time.monotonic()
     _log_request(
         "workflow_execution_started",
@@ -1757,6 +1799,7 @@ class CompletionRequest(BaseModel):
     size: Optional[str] = None
     resolution: Optional[Union[float, str]] = None
     fps: Optional[int] = None
+    steps: Optional[int] = None
     aspect_ratio: Optional[Union[str, float, int]] = None
     ratio: Optional[Union[str, float, int]] = None
     width: Optional[int] = None
@@ -1772,7 +1815,7 @@ def _build_workflow_params(request_data: CompletionRequest) -> Dict[str, Any]:
         request_data.params,
         request_data.workflow_params,
     )
-    for key in ("duration", "size", "resolution", "fps", "aspect_ratio", "ratio", "width", "height"):
+    for key in ("duration", "size", "resolution", "fps", "steps", "aspect_ratio", "ratio", "width", "height"):
         value = getattr(request_data, key, None)
         if value is not None:
             params[key] = value
@@ -1836,11 +1879,19 @@ def _workflow_parameter_snapshot(prompt: Dict[str, Any]) -> Dict[str, Any]:
         "duration",
         "length",
         "fps",
+        "steps",
         "start_time",
         "strict_duration",
         "video",
+        "aspect_ratio",
+        "resolution",
+        "size",
+        "width",
+        "height",
+        "megapixels",
     }
     interesting_classes = {
+        "start_workflow",
         "MiniMaxH3ImageToVideo",
         "MiniMaxH3ReferenceToVideo",
         "EmptyMiniMaxH3LatentAV",
@@ -1868,6 +1919,95 @@ def _workflow_parameter_snapshot(prompt: Dict[str, Any]) -> Dict[str, Any]:
             "inputs": selected_inputs,
         }
     return snapshot
+
+
+def _param_effectiveness_for_log(prompt, normalized_params, report):
+    effectiveness = {}
+    if not isinstance(normalized_params, dict):
+        return effectiveness
+
+    applied = report.get("applied") or [] if isinstance(report, dict) else []
+    ignored = report.get("ignored") or [] if isinstance(report, dict) else []
+    derived = report.get("derived") or {} if isinstance(report, dict) else {}
+
+    start_scalar_output_index = {
+        "duration": 25,
+        "fps": 26,
+        "resolution": 27,
+        "aspect_ratio": 28,
+        "size": 29,
+        "width": 30,
+        "height": 31,
+        "frame_count": 32,
+        "steps": 33,
+    }
+
+    final_values = {}
+    if isinstance(prompt, dict):
+        for node_id, node in prompt.items():
+            if not isinstance(node, dict) or node.get("class_type") != "start_workflow":
+                continue
+            inputs = node.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            for key, value in inputs.items():
+                final_values.setdefault(key, []).append({"node_id": str(node_id), "value": value})
+
+    def downstream_links(node_id, output_index):
+        links = []
+        if not isinstance(prompt, dict):
+            return links
+        for other_id, other_node in prompt.items():
+            inputs = other_node.get("inputs") if isinstance(other_node, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            for value in inputs.values():
+                if isinstance(value, list) and len(value) == 2 and value == [node_id, output_index]:
+                    links.append(f"{other_id}<-{node_id}[{output_index}]")
+        return links
+
+    for key in sorted(normalized_params.keys()):
+        requested = normalized_params.get(key)
+        applied_targets = [
+            target for target in applied
+            if target == key or (isinstance(target, str) and target.endswith("." + key))
+        ]
+        ignored_targets = [
+            target for target in ignored
+            if target == key or (isinstance(target, str) and target.endswith("." + key))
+        ]
+        finals = final_values.get(key, [])
+        final_matches = any(item.get("value") == requested for item in finals)
+
+        scalar_links = []
+        for target in applied_targets:
+            if not isinstance(target, str) or "." not in target:
+                continue
+            node_id, input_name = target.rsplit(".", 1)
+            output_index = start_scalar_output_index.get(input_name)
+            if output_index is not None:
+                scalar_links.extend(downstream_links(node_id, output_index))
+
+        input_applied = bool(applied_targets or (finals and final_matches))
+        effective = bool(
+            key in derived
+            or scalar_links
+            or (applied_targets and not any("." in str(target) for target in applied_targets))
+        )
+
+        effectiveness[key] = {
+            "requested": requested,
+            "applied_targets": applied_targets,
+            "ignored_targets": ignored_targets,
+            "start_workflow_final": finals,
+            "downstream_linked": bool(scalar_links),
+            "downstream_links": scalar_links[:20],
+            "derived": derived.get(key) if key in derived else None,
+            "input_applied": input_applied,
+            "effective": effective,
+        }
+
+    return effectiveness
 
 
 VALID_API_KEY = fastapi_api_key

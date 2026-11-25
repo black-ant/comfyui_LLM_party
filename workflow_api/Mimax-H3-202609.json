@@ -59,7 +59,8 @@
       "positive_prompt": "",
       "negative_prompt": "",
       "model_name": "",
-      "user_history": ""
+      "user_history": "",
+      "steps": 20
     },
     "class_type": "start_workflow",
     "_meta": {
@@ -241,7 +242,7 @@
     "inputs": {
       "prompt": [
         "127",
-        4
+        20
       ],
       "width": [
         "115",
@@ -340,8 +341,8 @@
         0
       ],
       "on_false": [
-        "105:124",
-        0
+        "127",
+        33
       ],
       "on_true": [
         "105:125",

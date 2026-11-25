@@ -33,6 +33,8 @@ _KEY_ALIASES = {
     "frame_rate": "fps",
     "framespersecond": "fps",
     "frame_rate_fps": "fps",
+    "samplingsteps": "steps",
+    "sampling_steps": "steps",
 }
 
 _INPUT_ALIASES = {
@@ -43,6 +45,7 @@ _INPUT_ALIASES = {
     "megapixels": ("megapixels", "mega_pixels", "megapixel"),
     "width": ("width",),
     "height": ("height",),
+    "steps": ("steps", "sampling_steps", "samplingSteps"),
 }
 
 _MINIMAX_H3_LENGTH_NODES = frozenset({

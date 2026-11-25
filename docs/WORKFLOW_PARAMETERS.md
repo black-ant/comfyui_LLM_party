@@ -12,6 +12,7 @@
     "resolution": "720p",
     "fps": 24,
     "duration": 6,
+    "steps": 20,
     "seed": 42
   }
 }
@@ -20,6 +21,8 @@
 ## 默认匹配
 
 服务会将参数匹配到工作流节点中同名的 `inputs`，例如 `seed`、`steps`、`cfg`、`fps`、`duration`、`width` 和 `height`。
+
+H3/CK 视频工作流中，`steps` 会先写入 Start Workflow 的 `steps` 控件，再从输出下标 33 连接到 BasicScheduler；已连线的输入不会被同名参数直接覆盖。
 
 `aspect_ratio` 配合 `resolution` 时会自动推导宽高，并按 8 的倍数对齐：
 
@@ -55,7 +58,7 @@
 }
 ```
 
-`ant-ai-2api` 的 ComfyUI 视频适配器会透传 `duration`、`resolution`、`fps`、`aspect_ratio` 和 `Params` 到 `workflow_params`。
+`ant-ai-2api` 的 ComfyUI 视频适配器会透传 `duration`、`resolution`、`fps`、`steps`、`aspect_ratio` 和 `Params` 到 `workflow_params`。
 
 工作流文件本身是参数来源的唯一事实：部署只同步 `comfyui_LLM_party/workflow_api/` 中实际存在的文件，不按模型名称套用统一工作流配置。当前仓库内的 H3 和 Wan 示例分别按自己的节点连接和默认值执行。
 
@@ -74,3 +77,7 @@ H3 的 `length` 即使已经连接到工作流中的时长/数学节点，也会
 如果 H3 工作流没有可识别的末端视频输出节点，或其 `video` 输入不是连线，Party 会在 `workflow_parameters_applied` 日志的 `derived.minimax_h3_trim_missing_reason` 中明确记录，不能据此声称最终输出已经严格裁剪。
 
 运行时可通过环境变量调整诊断行为：`COMFYUI_WORKFLOW_TIMEOUT_SEC` 控制整个工作流等待上限（默认 3600 秒），`COMFYUI_HTTP_TIMEOUT_SEC` 控制 ComfyUI 的单次 HTTP 请求超时（默认 30 秒），`COMFYUI_HISTORY_POLL_INTERVAL_SEC` 控制 history 轮询间隔（默认 0.25 秒）。`history_output_summary.assets` 会记录已拉回视频的实际 `video_duration_seconds`、`video_frame_count` 和 `video_fps`；如果探测失败，会记录 `video_probe_error`。部署时建议同时设置 `FASTAPI_BUILD_TAG` 和 `FASTAPI_BUILD_COMMIT`，启动及每次请求日志会带上实际部署版本。
+
+每次请求在提交给 ComfyUI 前会打印 `[final_comfyui_inputs]`，包含最终 `workflow_params`、`duration`、`fps`、`steps`、`aspect_ratio`、`resolution`、`size`、`width`、`height` 以及 `workflow_snapshot`。排查“ComfyUI 实际收到什么参数”时直接搜索该日志标签。
+
+同一阶段还会打印 `[param_effectiveness]`：逐个请求参数给出 `requested`、`applied_targets`、`ignored_targets`、`start_workflow_final`、`derived` 和 `effective`。判断“我传入的参数有没有生效”时直接搜索该标签，并看对应 key 的 `effective` 字段。

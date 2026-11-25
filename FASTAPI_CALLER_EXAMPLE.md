@@ -124,6 +124,7 @@ data: [DONE]
   - 视频（兼容写法）：`{"type":"video","url":"..."}` / `{"type":"input_video","data":"<base64>","format":"mp4"}`
   - 音频：`{"type":"audio_url","audio_url":{"url":"..."}}` / `{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}`
 - `stream` `boolean`：是否流式（默认 `false`）
+- `steps` `int`：可选，采样步数；会写入 Start Workflow 的 `steps` 控件，再由工作流传给采样节点
 - `max_tokens` `int`：保留字段
 - `storage_profile` `string`：可选，指定对象存储配置档
 - `workflow_params` `object`：可选，按名字写进 Start Workflow 控件的参数（见下方参考素材落位）
@@ -134,6 +135,7 @@ data: [DONE]
 - 音频按出现顺序写入 `audio_path1..audio_path3`。
 - 参考视频按 24 fps 解码，超出生成时长（或 15 秒）的部分会被截断；解码失败会直接报错，不会静默输出空参考。
 - 也可用 `workflow_params` 直接覆盖这些控件，例如 `{"video_path1":"C:/refs/clip.mp4","img_path3":"C:/refs/third.png"}`。
+- 采样步数可用 `{"workflow_params":{"steps":20}}` 或顶层 `{"steps":20}` 控制；H3 视频工作流会把 Start Workflow 的 `steps` 输出连到 BasicScheduler。
 
 ## 6) 出参字段说明（非流式）
 - `choices[0].message.content`：文本与 markdown 链接
