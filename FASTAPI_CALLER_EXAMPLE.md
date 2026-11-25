@@ -120,9 +120,20 @@ data: [DONE]
   - 文本：`{"type":"text","text":"..."}`
   - 图片（字符串）：`{"type":"image_url","image_url":"https://... 或 data:image/..."}`
   - 图片（对象）：`{"type":"image_url","image_url":{"url":"https://... 或 data:image/..."}}`
+  - 视频：`{"type":"video_url","video_url":{"url":"https://...mp4 或 data:video/mp4;base64,... 或 本地绝对路径"}}`
+  - 视频（兼容写法）：`{"type":"video","url":"..."}` / `{"type":"input_video","data":"<base64>","format":"mp4"}`
+  - 音频：`{"type":"audio_url","audio_url":{"url":"..."}}` / `{"type":"input_audio","input_audio":{"data":"<base64>","format":"wav"}}`
 - `stream` `boolean`：是否流式（默认 `false`）
 - `max_tokens` `int`：保留字段
 - `storage_profile` `string`：可选，指定对象存储配置档
+- `workflow_params` `object`：可选，按名字写进 Start Workflow 控件的参数（见下方参考素材落位）
+
+### 参考素材落位（Start Workflow 节点）
+- 图片按出现顺序写入 `img_path1..img_path9`（最多 9 张，超出部分丢弃并在日志 `reference_media_truncated` 记录）。
+- 视频按出现顺序写入 `video_path1..video_path3`；视频自带音轨会自动作为对应 `video_audio` 参考输出，可用 `video_audio_path1..3` 覆盖。
+- 音频按出现顺序写入 `audio_path1..audio_path3`。
+- 参考视频按 24 fps 解码，超出生成时长（或 15 秒）的部分会被截断；解码失败会直接报错，不会静默输出空参考。
+- 也可用 `workflow_params` 直接覆盖这些控件，例如 `{"video_path1":"C:/refs/clip.mp4","img_path3":"C:/refs/third.png"}`。
 
 ## 6) 出参字段说明（非流式）
 - `choices[0].message.content`：文本与 markdown 链接

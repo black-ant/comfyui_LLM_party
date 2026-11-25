@@ -16,6 +16,7 @@ import xlrd
 from PIL import Image, ImageOps, ImageSequence
 from markdownify import markdownify as md
 from ..config import current_dir_path
+from .video_parameters import resolve_frame_count, resolve_video_dimensions
 
 file_path = os.path.join(current_dir_path, "file")
 programming_languages_extensions = [".py", ".js", ".java", ".c", ".cpp", ".html", ".css", ".sql", ".r", ".swift"]
@@ -244,6 +245,172 @@ def convert_image_to_compatible_format(image_path):
     return img_tensor
 
 
+# MiniMax H3 等参考视频模型按 24 fps 对齐参考素材，参考视频最长 15 秒。
+REFERENCE_VIDEO_FPS = 24
+MAX_REFERENCE_VIDEO_SECONDS = 15.0
+IMAGE_FILE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif")
+
+
+def resolve_media_path(path):
+    """把 start_workflow 的路径控件值解析成真实文件路径。
+
+    控件值可能是 API 调用方传入的绝对路径，也可能是通过 ComfyUI 上传控件
+    传入的 input 目录文件名，两种都要能加载。
+    """
+    raw = str(path or "").strip().strip('"')
+    if not raw:
+        return ""
+    if os.path.exists(raw):
+        return raw
+    try:
+        import folder_paths
+
+        candidate = folder_paths.get_annotated_filepath(raw)
+    except Exception:
+        candidate = ""
+    if candidate and os.path.exists(candidate):
+        return candidate
+    return raw
+
+
+def load_image_batch(path):
+    """加载一张图片（或一个图片目录）为 IMAGE 批量张量。"""
+    targets = []
+    if os.path.isdir(path):
+        targets = [
+            os.path.join(path, filename)
+            for filename in os.listdir(path)
+            if filename.lower().endswith(IMAGE_FILE_EXTENSIONS)
+        ]
+    elif path:
+        targets = [path]
+
+    frames = []
+    for target in targets:
+        with Image.open(target) as image_file:
+            for frame in ImageSequence.Iterator(image_file):
+                frame = ImageOps.exif_transpose(frame)
+                if frame.mode == "I":
+                    frame = frame.point(lambda i: i * (1 / 256)).convert("L")
+                array = np.array(frame.convert("RGB")).astype(np.float32) / 255.0
+                frames.append(torch.from_numpy(array).unsqueeze(0))
+
+    if not frames:
+        if os.path.isdir(path):
+            print(f"[start_workflow] 目录中没有可用的图片: {path}")
+        return None
+    if len(frames) == 1:
+        return frames[0]
+    return torch.cat(frames, dim=0)
+
+
+def load_reference_video(path, max_frames=None):
+    """解码参考视频，返回 (IMAGE 帧序列, AUDIO 音轨或 None)。
+
+    帧序列按 24 fps 重采样（参考视频模型的时间轴），并截断到
+    ``max_frames``，避免为一段长视频白白解码/占用显存。
+    """
+    from comfy_api.input_impl import VideoFromFile
+
+    duration = 0.0
+    if max_frames:
+        duration = min(MAX_REFERENCE_VIDEO_SECONDS, float(max_frames) / REFERENCE_VIDEO_FPS)
+    components = VideoFromFile(path, duration=duration).get_components()
+
+    frames = components.images
+    if not isinstance(frames, torch.Tensor) or frames.shape[0] == 0:
+        raise ValueError(f"没有从参考视频中解码出画面: {path}")
+
+    source_fps = _positive_float(components.frame_rate, REFERENCE_VIDEO_FPS)
+    if abs(source_fps - REFERENCE_VIDEO_FPS) > 0.01:
+        frames = frames[resample_video_frame_indices(frames.shape[0], source_fps)]
+    if max_frames:
+        frames = frames[: int(max_frames)]
+    if frames.shape[0] == 0:
+        raise ValueError(f"参考视频截断后没有剩余帧: {path}")
+
+    soundtrack = components.audio
+    audio = None
+    if soundtrack is not None:
+        waveform = soundtrack.get("waveform")
+        if waveform is not None and waveform.numel() > 0:
+            audio = {
+                "waveform": waveform.float(),
+                "sample_rate": int(soundtrack["sample_rate"]),
+            }
+    return frames.contiguous(), audio
+
+
+def resample_video_frame_indices(frame_count, source_fps):
+    """把源帧映射到 24 fps 参考时间轴上的最近帧下标。"""
+    if frame_count <= 0:
+        return []
+    if source_fps <= 0:
+        return list(range(frame_count))
+    target_count = max(1, int(round(frame_count * REFERENCE_VIDEO_FPS / source_fps)))
+    step = source_fps / REFERENCE_VIDEO_FPS
+    return [min(frame_count - 1, int(round(index * step))) for index in range(target_count)]
+
+
+def load_reference_audio(path):
+    """把音频文件（也可以是带音轨的视频）解码成 ComfyUI AUDIO 字典。"""
+    waveform, sample_rate = _decode_audio_file(path)
+    if waveform is None or waveform.numel() == 0:
+        raise ValueError(f"没有从参考音频中解码出声音: {path}")
+    waveform = waveform.float()
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+    return {"waveform": waveform.unsqueeze(0), "sample_rate": int(sample_rate)}
+
+
+def _decode_audio_file(path):
+    try:
+        from comfy_extras.nodes_audio import load as load_comfy_audio
+    except Exception:
+        load_comfy_audio = None
+    if load_comfy_audio is not None:
+        return load_comfy_audio(path)
+    return _decode_audio_with_av(path)
+
+
+def _decode_audio_with_av(path):
+    import av
+
+    with av.open(path) as container:
+        stream = next((item for item in container.streams if item.type == "audio"), None)
+        if stream is None:
+            raise ValueError(f"文件中没有音频流: {path}")
+        sample_rate = int(stream.codec_context.sample_rate or stream.rate or 44100)
+        channels = stream.codec_context.channels or 1
+
+        chunks = []
+        for frame in container.decode(streams=stream.index):
+            chunk = torch.from_numpy(frame.to_ndarray())
+            if chunk.shape[0] != channels:
+                chunk = chunk.view(-1, channels).t()
+            chunks.append(chunk)
+
+        if not chunks:
+            raise ValueError(f"没有解码出音频帧: {path}")
+        waveform = torch.cat(chunks, dim=1)
+
+    if waveform.dtype.is_floating_point:
+        return waveform.float(), sample_rate
+    if waveform.dtype == torch.int16:
+        return waveform.float() / (2**15), sample_rate
+    if waveform.dtype == torch.int32:
+        return waveform.float() / (2**31), sample_rate
+    raise ValueError(f"不支持的音频采样格式 {waveform.dtype}: {path}")
+
+
+def _positive_float(value, default=None):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 class start_workflow:
     @classmethod
     def INPUT_TYPES(s):
@@ -262,13 +429,31 @@ class start_workflow:
                 "negative_prompt": ("STRING", {"default": ""}),
                 "model_name": ("STRING", {"default": ""}),
                 "user_history": ("STRING", {"default": ""}),
-                "duration": ("INT", {"default": 5, "min": 0, "max": 120, "step": 1}),
-                "fps": ("INT", {"default": 16, "min": 0, "max": 120, "step": 1}),
+                "duration": ("FLOAT", {"default": 5.0, "min": 0.0, "max": 120.0, "step": 0.1}),
+                "fps": ("FLOAT", {"default": 16.0, "min": 1.0, "max": 120.0, "step": 0.1}),
                 "resolution": ("STRING", {"default": ""}),
                 "aspect_ratio": ("STRING", {"default": ""}),
                 "size": ("STRING", {"default": ""}),
                 "width": ("INT", {"default": 640, "min": 0, "max": 8192, "step": 8}),
                 "height": ("INT", {"default": 640, "min": 0, "max": 8192, "step": 8}),
+                # 多参考素材（MiniMax H3 ref2v 等）：最多 9 张参考图、3 段参考视频，
+                # 每段视频可配 1 条音轨，另有 3 段独立参考音频。
+                "img_path3": ("STRING", {"default": "", "image_upload": True}),
+                "img_path4": ("STRING", {"default": "", "image_upload": True}),
+                "img_path5": ("STRING", {"default": "", "image_upload": True}),
+                "img_path6": ("STRING", {"default": "", "image_upload": True}),
+                "img_path7": ("STRING", {"default": "", "image_upload": True}),
+                "img_path8": ("STRING", {"default": "", "image_upload": True}),
+                "img_path9": ("STRING", {"default": "", "image_upload": True}),
+                "video_path1": ("STRING", {"default": "", "video_upload": True}),
+                "video_path2": ("STRING", {"default": "", "video_upload": True}),
+                "video_path3": ("STRING", {"default": "", "video_upload": True}),
+                "video_audio_path1": ("STRING", {"default": "", "audio_upload": True}),
+                "video_audio_path2": ("STRING", {"default": "", "audio_upload": True}),
+                "video_audio_path3": ("STRING", {"default": "", "audio_upload": True}),
+                "audio_path1": ("STRING", {"default": "", "audio_upload": True}),
+                "audio_path2": ("STRING", {"default": "", "audio_upload": True}),
+                "audio_path3": ("STRING", {"default": "", "audio_upload": True}),
             },
         }
 
@@ -290,6 +475,26 @@ class start_workflow:
         "INT",
         "INT",
         "INT",
+        # 参考图 image3..image9
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        # 参考视频 video1..video3
+        "IMAGE",
+        "IMAGE",
+        "IMAGE",
+        # 参考视频音轨 video_audio1..video_audio3
+        "AUDIO",
+        "AUDIO",
+        "AUDIO",
+        # 独立参考音频 audio1..audio3
+        "AUDIO",
+        "AUDIO",
+        "AUDIO",
     )
     RETURN_NAMES = (
         "file_content",
@@ -309,6 +514,22 @@ class start_workflow:
         "width",
         "height",
         "frame_count",
+        "image3",
+        "image4",
+        "image5",
+        "image6",
+        "image7",
+        "image8",
+        "image9",
+        "video1",
+        "video2",
+        "video3",
+        "video_audio1",
+        "video_audio2",
+        "video_audio3",
+        "audio1",
+        "audio2",
+        "audio3",
     )
 
     FUNCTION = "load_all"
@@ -338,6 +559,22 @@ class start_workflow:
         size="",
         width=640,
         height=640,
+        img_path3="",
+        img_path4="",
+        img_path5="",
+        img_path6="",
+        img_path7="",
+        img_path8="",
+        img_path9="",
+        video_path1="",
+        video_path2="",
+        video_path3="",
+        video_audio_path1="",
+        video_audio_path2="",
+        video_audio_path3="",
+        audio_path1="",
+        audio_path2="",
+        audio_path3="",
     ):
         file_out = []
         if file_content is not None and file_content != "":
@@ -359,74 +596,10 @@ class start_workflow:
         if isinstance(image_input2, torch.Tensor):
             img_out2 = image_input2
         if img_path1 is not None and img_path1 != "":
-            img_out = []
-            # 检查img_path是否是一个目录
-            if os.path.isdir(img_path1):
-                # 遍历目录中的所有文件
-                for filename in os.listdir(img_path1):
-                    # 检查文件是否是图片
-                    if filename.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif")):
-                        img_full_path = os.path.join(img_path1, filename)
-                        img = Image.open(img_full_path)
-                        img = ImageOps.exif_transpose(img)
-                        if img.mode == "I":
-                            img = img.point(lambda i: i * (1 / 256)).convert("L")
-                        image = img.convert("RGB")
-                        image = np.array(image).astype(np.float32) / 255.0
-                        image = torch.from_numpy(image).unsqueeze(0)
-                        img_out.append(image)
-            else:
-                img = Image.open(img_path1)
-                for i in ImageSequence.Iterator(img):
-                    i = ImageOps.exif_transpose(i)
-                    if i.mode == "I":
-                        i = i.point(lambda i: i * (1 / 256)).convert("L")
-                    image = i.convert("RGB")
-                    image = np.array(image).astype(np.float32) / 255.0
-                    image = torch.from_numpy(image).unsqueeze(0)
-                    img_out.append(image)
-
-            if len(img_out) > 1:
-                img_out = torch.cat(img_out, dim=0)
-            elif img_out:
-                img_out = img_out[0]
-            else:
-                img_out = None
+            img_out = load_image_batch(resolve_media_path(img_path1))
 
         if img_path2 is not None and img_path2 != "":
-            img_out2 = []
-            # 检查img_path是否是一个目录
-            if os.path.isdir(img_path2):
-                # 遍历目录中的所有文件
-                for filename in os.listdir(img_path2):
-                    # 检查文件是否是图片
-                    if filename.lower().endswith((".png", ".jpg", ".jpeg", ".tiff", ".bmp", ".gif")):
-                        img_full_path = os.path.join(img_path2, filename)
-                        img = Image.open(img_full_path)
-                        img = ImageOps.exif_transpose(img)
-                        if img.mode == "I":
-                            img = img.point(lambda i: i * (1 / 256)).convert("L")
-                        image = img.convert("RGB")
-                        image = np.array(image).astype(np.float32) / 255.0
-                        image = torch.from_numpy(image).unsqueeze(0)
-                        img_out2.append(image)
-            else:
-                img = Image.open(img_path2)
-                for i in ImageSequence.Iterator(img):
-                    i = ImageOps.exif_transpose(i)
-                    if i.mode == "I":
-                        i = i.point(lambda i: i * (1 / 256)).convert("L")
-                    image = i.convert("RGB")
-                    image = np.array(image).astype(np.float32) / 255.0
-                    image = torch.from_numpy(image).unsqueeze(0)
-                    img_out2.append(image)
-
-            if len(img_out2) > 1:
-                img_out2 = torch.cat(img_out2, dim=0)
-            elif img_out2:
-                img_out2 = img_out2[0]
-            else:
-                img_out2 = None
+            img_out2 = load_image_batch(resolve_media_path(img_path2))
 
         system_out = system_prompt
         user_out = user_prompt
@@ -450,7 +623,54 @@ class start_workflow:
             height_out = int(height)
         except (TypeError, ValueError):
             height_out = 640
-        frame_count_out = max(1, int(round(duration_out * fps_out)) + 1)
+        width_out, height_out = resolve_video_dimensions(
+            width_out,
+            height_out,
+            resolution,
+            size,
+            aspect_ratio,
+        )
+        frame_count_out = resolve_frame_count(duration_out, fps_out)
+
+        # 参考图 3..9：@image / API 多图请求都会落到这里
+        reference_image_outs = []
+        for image_path in (img_path3, img_path4, img_path5, img_path6, img_path7, img_path8, img_path9):
+            resolved_image = resolve_media_path(image_path)
+            reference_image_outs.append(load_image_batch(resolved_image) if resolved_image else None)
+
+        # 参考视频（参考视频模型的参考片段），音轨默认取视频自带的，
+        # 也可以用 video_audio_pathN 覆盖
+        reference_video_frames = []
+        reference_video_audios = []
+        for video_path, video_audio_path in (
+            (video_path1, video_audio_path1),
+            (video_path2, video_audio_path2),
+            (video_path3, video_audio_path3),
+        ):
+            resolved_video = resolve_media_path(video_path)
+            resolved_audio = resolve_media_path(video_audio_path)
+
+            frames = None
+            soundtrack = None
+            if resolved_video:
+                frames, soundtrack = load_reference_video(resolved_video, max_frames=frame_count_out)
+                if soundtrack is None:
+                    print(f"[start_workflow] 参考视频没有音轨，video_audio 输出为空: {resolved_video}")
+            if resolved_audio:
+                soundtrack = load_reference_audio(resolved_audio)
+                if frames is None:
+                    print(f"[start_workflow] 参考音轨缺少对应的参考视频，会被下游忽略: {resolved_audio}")
+            reference_video_frames.append(frames)
+            reference_video_audios.append(soundtrack)
+
+        # 独立参考音频 1..3
+        reference_audios = []
+        for audio_path in (audio_path1, audio_path2, audio_path3):
+            resolved_audio_path = resolve_media_path(audio_path)
+            reference_audios.append(
+                load_reference_audio(resolved_audio_path) if resolved_audio_path else None
+            )
+
         return (
             file_out,
             img_out,
@@ -469,6 +689,10 @@ class start_workflow:
             width_out,
             height_out,
             frame_count_out,
+            *reference_image_outs,
+            *reference_video_frames,
+            *reference_video_audios,
+            *reference_audios,
         )
 
 

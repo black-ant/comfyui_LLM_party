@@ -382,6 +382,162 @@ def _image_fetch_failure_detail(response):
     return "Image could not be retrieved."
 
 
+REFERENCE_IMAGE_INPUT_LIMIT = 9
+REFERENCE_VIDEO_INPUT_LIMIT = 3
+REFERENCE_AUDIO_INPUT_LIMIT = 3
+VIDEO_CONTENT_TYPES = {"video_url", "input_video", "video", "reference_video", "first_video"}
+AUDIO_CONTENT_TYPES = {"audio_url", "input_audio", "audio", "reference_audio"}
+AUDIO_FILE_EXTENSIONS = {".wav", ".mp3", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".wma"}
+DEFAULT_MEDIA_SUFFIX = {"video": ".mp4", "audio": ".wav"}
+
+
+def _first_media_paths(candidates, limit):
+    paths = []
+    for candidate in candidates:
+        value = str(candidate or "").strip()
+        if not value or value in paths:
+            continue
+        paths.append(value)
+        if len(paths) >= limit:
+            break
+    return paths
+
+
+def _build_start_workflow_media_inputs(
+    img_path="",
+    img_path2="",
+    img_paths=None,
+    video_paths=None,
+    audio_paths=None,
+):
+    """把请求里的参考素材映射到 Start Workflow 的参考槽位。
+
+    图片槽位沿用 img_path1/2（历史行为：没有图片时清空），其余槽位只在请求
+    真的带素材时才写入，避免覆盖节点里手工填好的路径。
+    """
+    images = _first_media_paths(
+        [img_path, img_path2, *(img_paths or [])],
+        REFERENCE_IMAGE_INPUT_LIMIT,
+    )
+    videos = _first_media_paths(video_paths or [], REFERENCE_VIDEO_INPUT_LIMIT)
+    audios = _first_media_paths(audio_paths or [], REFERENCE_AUDIO_INPUT_LIMIT)
+
+    inputs = {}
+    for index in range(REFERENCE_IMAGE_INPUT_LIMIT):
+        if index < len(images):
+            inputs[f"img_path{index + 1}"] = images[index]
+        elif index < 2:
+            inputs[f"img_path{index + 1}"] = ""
+    for index, value in enumerate(videos):
+        inputs[f"video_path{index + 1}"] = value
+    for index, value in enumerate(audios):
+        inputs[f"audio_path{index + 1}"] = value
+    return inputs
+
+
+def _media_suffix_from_hint(hint, media_kind: str):
+    """从扩展名 / 裸格式名 / MIME 推断保存后缀。"""
+    raw = str(hint or "").strip().lower().split(";", 1)[0]
+    if not raw:
+        return DEFAULT_MEDIA_SUFFIX[media_kind]
+    if raw.startswith("."):
+        candidate = raw
+    elif "/" in raw:
+        candidate = mimetypes.guess_extension(raw) or ""
+    else:
+        candidate = "." + raw
+    allowed = VIDEO_FILE_EXTENSIONS if media_kind == "video" else AUDIO_FILE_EXTENSIONS
+    if candidate in allowed:
+        return candidate
+    return DEFAULT_MEDIA_SUFFIX[media_kind]
+
+
+def _decode_base64_media(data):
+    """解码 base64（含 data URI），返回 (bytes, mime 提示)。"""
+    payload = str(data or "").strip()
+    hint = ""
+    if payload.startswith("data:"):
+        header, _, payload = payload.partition(",")
+        hint = header[5:].split(";", 1)[0]
+    elif ";base64," in payload:
+        header, payload = payload.split(";base64,", 1)
+        hint = header.split(":", 1)[-1]
+    try:
+        return base64.b64decode(payload), hint
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid base64 media payload: {exc}") from exc
+
+
+async def _load_message_media(content: Dict[str, Any], media_kind: str):
+    """读取消息里的视频/音频引用，返回 (bytes, suffix, source_info)。"""
+    url = ""
+    for key in ("video_url", "audio_url", "url"):
+        value = content.get(key)
+        if isinstance(value, str) and value.strip():
+            url = value.strip()
+            break
+        if isinstance(value, dict):
+            nested = str(value.get("url") or "").strip()
+            if nested:
+                url = nested
+                break
+
+    if not url:
+        for key in ("input_video", "input_audio", "data", "base64"):
+            value = content.get(key)
+            raw = ""
+            hint = ""
+            if isinstance(value, dict):
+                raw = str(value.get("data") or "").strip()
+                hint = str(value.get("format") or "")
+            elif isinstance(value, str):
+                raw = value.strip()
+            if raw:
+                media_bytes, header_hint = _decode_base64_media(raw)
+                suffix = _media_suffix_from_hint(hint or header_hint, media_kind)
+                return media_bytes, suffix, {"source_type": "base64"}
+        raise HTTPException(
+            status_code=400,
+            detail=f"{media_kind} reference must provide video_url/audio_url/url or base64 data",
+        )
+
+    if url.startswith("data:"):
+        media_bytes, header_hint = _decode_base64_media(url)
+        return media_bytes, _media_suffix_from_hint(header_hint, media_kind), {"source_type": "data_uri"}
+
+    if os.path.isfile(url):
+        with open(url, "rb") as media_file:
+            media_bytes = media_file.read()
+        return (
+            media_bytes,
+            _media_suffix_from_hint(os.path.splitext(url)[1], media_kind),
+            {"source_type": "local_file", "path": _safe_preview(url)},
+        )
+
+    async with httpx.AsyncClient() as client:
+        response = await client.get(url)
+    if response.status_code != 200:
+        raise HTTPException(status_code=400, detail=f"{media_kind} could not be retrieved.")
+    parsed = urllib.parse.urlparse(url)
+    suffix = _media_suffix_from_hint(
+        response.headers.get("content-type") or os.path.splitext(parsed.path)[1],
+        media_kind,
+    )
+    return response.content, suffix, {
+        "source_type": "remote_url",
+        "url_host": parsed.netloc,
+        "url_path": _safe_preview(parsed.path),
+    }
+
+
+def _save_reference_media(media_item, media_kind: str, request_id: str, index: int, input_dir: str):
+    filename = f"api_{media_kind}_{int(time.time() * 1000)}_{request_id}_{index}{media_item['suffix']}"
+    media_path = os.path.join(input_dir, filename)
+    with open(media_path, "wb") as media_file:
+        media_file.write(media_item["bytes"])
+    return media_path
+
+
 def _log_prompt_texts(
     request_id: str,
     workflow_path: str,
@@ -1354,6 +1510,9 @@ def api(
     user_history="",
     request_id="",
     img_path2="",
+    img_paths=None,
+    video_paths=None,
+    audio_paths=None,
     progress_callback: ProgressCallback = None,
     workflow_params=None,
 ):
@@ -1453,8 +1612,15 @@ def api(
                         {"type": str(type(image_input))},
                     )
             inputs["file_path"] = file_path
-            inputs["img_path1"] = img_path
-            inputs["img_path2"] = img_path2
+            inputs.update(
+                _build_start_workflow_media_inputs(
+                    img_path=img_path,
+                    img_path2=img_path2,
+                    img_paths=img_paths,
+                    video_paths=video_paths,
+                    audio_paths=audio_paths,
+                )
+            )
             inputs["system_prompt"] = system_prompt
             inputs["user_prompt"] = user_prompt
             inputs["positive_prompt"] = positive_prompt
@@ -1476,8 +1642,18 @@ def api(
                     "node_id": p,
                     "image_input_count": len(image_input) if isinstance(image_input, list) else 0,
                     "image_input_serializable": image_input_serializable,
-                    "img_path1": inputs.get("img_path1", ""),
-                    "img_path2": inputs.get("img_path2", ""),
+                    "img_paths": [
+                        inputs.get(f"img_path{index}", "")
+                        for index in range(1, REFERENCE_IMAGE_INPUT_LIMIT + 1)
+                    ],
+                    "video_paths": [
+                        inputs.get(f"video_path{index}", "")
+                        for index in range(1, REFERENCE_VIDEO_INPUT_LIMIT + 1)
+                    ],
+                    "audio_paths": [
+                        inputs.get(f"audio_path{index}", "")
+                        for index in range(1, REFERENCE_AUDIO_INPUT_LIMIT + 1)
+                    ],
                     "build_tag": FASTAPI_BUILD_TAG,
                     "build_commit": FASTAPI_BUILD_COMMIT,
                 },
@@ -1577,7 +1753,7 @@ class CompletionRequest(BaseModel):
     max_tokens: int = 150
     stream: bool = False
     storage_profile: Optional[str] = None
-    duration: Optional[int] = None
+    duration: Optional[float] = None
     size: Optional[str] = None
     resolution: Optional[Union[float, str]] = None
     fps: Optional[int] = None
@@ -2008,6 +2184,9 @@ async def process_request(
     _log_request("model_name", request_id, {"model_name": model_name})
     raw_images_bytes = []
     image_sources = []
+    raw_videos = []
+    raw_audios = []
+    media_sources = {"video": [], "audio": []}
     system_prompt = ""
     user_prompt = ""
     user_histories = []
@@ -2121,6 +2300,14 @@ async def process_request(
                             status_code=400,
                             detail="image_url/first_frame/last_frame must be a string URL or object with image_url.url",
                         )
+                elif content["type"] in VIDEO_CONTENT_TYPES:
+                    media_bytes, media_suffix, media_source = await _load_message_media(content, "video")
+                    raw_videos.append({"bytes": media_bytes, "suffix": media_suffix})
+                    media_sources["video"].append(media_source)
+                elif content["type"] in AUDIO_CONTENT_TYPES:
+                    media_bytes, media_suffix, media_source = await _load_message_media(content, "audio")
+                    raw_audios.append({"bytes": media_bytes, "suffix": media_suffix})
+                    media_sources["audio"].append(media_source)
 
     _log_request(
         "messages_parsed",
@@ -2130,6 +2317,10 @@ async def process_request(
             "user_prompt": user_prompt,
             "image_count": len(raw_images_bytes),
             "image_sources": image_sources,
+            "video_count": len(raw_videos),
+            "video_sources": media_sources["video"],
+            "audio_count": len(raw_audios),
+            "audio_sources": media_sources["audio"],
         },
     )
 
@@ -2152,6 +2343,22 @@ async def process_request(
 
     img_path1 = image_path_list[0] if len(image_path_list) > 0 else ""
     img_path2 = image_path_list[1] if len(image_path_list) > 1 else ""
+
+    video_path_list = [
+        _save_reference_media(item, "video", request_id, index + 1, input_dir)
+        for index, item in enumerate(raw_videos[:REFERENCE_VIDEO_INPUT_LIMIT])
+    ]
+    audio_path_list = [
+        _save_reference_media(item, "audio", request_id, index + 1, input_dir)
+        for index, item in enumerate(raw_audios[:REFERENCE_AUDIO_INPUT_LIMIT])
+    ]
+    dropped_media = {
+        "video": max(0, len(raw_videos) - REFERENCE_VIDEO_INPUT_LIMIT),
+        "audio": max(0, len(raw_audios) - REFERENCE_AUDIO_INPUT_LIMIT),
+        "image": max(0, len(image_path_list) - REFERENCE_IMAGE_INPUT_LIMIT),
+    }
+    if any(dropped_media.values()):
+        _log_request("reference_media_truncated", request_id, dropped_media)
     _log_request(
         "image_pipeline",
         request_id,
@@ -2160,6 +2367,8 @@ async def process_request(
             "img_path1": img_path1,
             "img_path2": img_path2,
             "all_paths": image_path_list,
+            "video_paths": video_path_list,
+            "audio_paths": audio_path_list,
         },
     )
 
@@ -2182,6 +2391,8 @@ async def process_request(
             "workflow_params": effective_workflow_params,
             "duration": effective_workflow_params.get("duration"),
             "workflow_param_keys": sorted(effective_workflow_params.keys()),
+            "video_path_count": len(video_path_list),
+            "audio_path_count": len(audio_path_list),
         },
     )
     _log_prompt_texts(
@@ -2199,6 +2410,9 @@ async def process_request(
         file_path="",
         img_path=img_path1,
         img_path2=img_path2,
+        img_paths=image_path_list,
+        video_paths=video_path_list,
+        audio_paths=audio_path_list,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         positive_prompt="",
