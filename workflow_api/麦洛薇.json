@@ -4,7 +4,7 @@
       "system_prompt": "",
       "user_prompt": [
         "28",
-        3
+        19
       ],
       "temperature": 0.7,
       "is_memory": "enable",

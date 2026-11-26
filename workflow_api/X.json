@@ -40,7 +40,7 @@
       "max_length": 1920,
       "user_prompt_input": [
         "24",
-        4
+        20
       ],
       "imgbb_api_key": "",
       "conversation_rounds": 100,

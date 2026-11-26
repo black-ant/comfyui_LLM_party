@@ -32,7 +32,7 @@
     "inputs": {
       "input_str": [
         "11",
-        4
+        20
       ],
       "prompt": "根据我输入的主题写一首诗",
       "model_name": "gpt-4o-mini",

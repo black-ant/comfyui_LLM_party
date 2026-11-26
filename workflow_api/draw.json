@@ -101,7 +101,7 @@
     "inputs": {
       "prompt": [
         "11",
-        4
+        20
       ],
       "model_name": "gpt-4o-mini",
       "base_url": "",
